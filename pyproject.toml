@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novelaire"
+version = "0.1.0.dev0"
+description = "Spec-driven vibe writing CLI."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+  "anthropic>=0.75.0",
+  "openai>=2.14.0",
+]
+
+[project.scripts]
+novelaire = "novelaire.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["novelaire*"]

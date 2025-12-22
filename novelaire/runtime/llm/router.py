@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .config import ModelConfig
+from .errors import ModelResolutionError
+from .types import ModelCapabilities, ModelProfile, ModelRequirements, ModelRole
+
+
+@dataclass(frozen=True)
+class ResolvedModel:
+    role: ModelRole
+    profile: ModelProfile
+    requirements: ModelRequirements
+    why: str
+
+
+class ModelRouter:
+    def __init__(self, config: ModelConfig) -> None:
+        self._config = config
+
+    def resolve(self, *, role: ModelRole, requirements: ModelRequirements) -> ResolvedModel:
+        profile_id = self._config.role_pointers.get(role)
+        if profile_id is None:
+            raise ModelResolutionError(
+                f"No model configured for role '{role}'.",
+                role=str(role),
+            )
+
+        profile = self._config.profiles.get(profile_id)
+        if profile is None:
+            raise ModelResolutionError(
+                f"Role '{role}' points to missing profile '{profile_id}'.",
+                role=str(role),
+                profile_id=profile_id,
+            )
+
+        caps = profile.capabilities.with_provider_defaults(profile.provider_kind)
+        self._assert_requirements(profile=profile, capabilities=caps, requirements=requirements)
+
+        why = f"role={role} -> profile_id={profile.profile_id} (explicit pointer)"
+        return ResolvedModel(role=role, profile=profile, requirements=requirements, why=why)
+
+    @staticmethod
+    def _assert_requirements(
+        *,
+        profile: ModelProfile,
+        capabilities: ModelCapabilities,
+        requirements: ModelRequirements,
+    ) -> None:
+        if requirements.needs_streaming and capabilities.supports_streaming is not True:
+            raise ModelResolutionError(
+                f"Profile '{profile.profile_id}' does not support streaming.",
+                role=None,
+                profile_id=profile.profile_id,
+            )
+        if requirements.needs_tools and capabilities.supports_tools is not True:
+            raise ModelResolutionError(
+                f"Profile '{profile.profile_id}' does not support tools.",
+                role=None,
+                profile_id=profile.profile_id,
+            )
+        if (
+            requirements.needs_structured_output
+            and capabilities.supports_structured_output is not True
+        ):
+            raise ModelResolutionError(
+                f"Profile '{profile.profile_id}' does not support structured output.",
+                role=None,
+                profile_id=profile.profile_id,
+            )
+        if requirements.min_context_tokens is not None:
+            if profile.limits is None or profile.limits.context_limit_tokens is None:
+                raise ModelResolutionError(
+                    f"Profile '{profile.profile_id}' does not declare a context limit.",
+                    role=None,
+                    profile_id=profile.profile_id,
+                )
+            if profile.limits.context_limit_tokens < requirements.min_context_tokens:
+                raise ModelResolutionError(
+                    f"Profile '{profile.profile_id}' context limit is too small.",
+                    role=None,
+                    profile_id=profile.profile_id,
+                )
+
