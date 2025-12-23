@@ -4,7 +4,7 @@ from urllib.parse import urljoin, urlparse
 
 from ..errors import ProviderAdapterError
 from ..secrets import resolve_credential
-from ..types import CanonicalMessageRole, CanonicalRequest, ModelProfile, ProviderKind, ToolSpec
+from ..types import CanonicalMessageRole, CanonicalRequest, ModelProfile, ProviderKind, ToolCall, ToolSpec
 from .base import PreparedRequest
 
 
@@ -42,7 +42,15 @@ class AnthropicAdapter:
             if msg.role is CanonicalMessageRole.USER:
                 messages.append({"role": "user", "content": msg.content})
             elif msg.role is CanonicalMessageRole.ASSISTANT:
-                messages.append({"role": "assistant", "content": msg.content})
+                if msg.tool_calls:
+                    blocks = []
+                    if msg.content:
+                        blocks.append({"type": "text", "text": msg.content})
+                    for call in msg.tool_calls:
+                        blocks.append(_tool_call_to_anthropic(call))
+                    messages.append({"role": "assistant", "content": blocks})
+                else:
+                    messages.append({"role": "assistant", "content": msg.content})
             elif msg.role is CanonicalMessageRole.TOOL:
                 if not msg.tool_call_id:
                     raise ProviderAdapterError("Tool message is missing tool_call_id.")
@@ -73,6 +81,17 @@ def _tool_spec_to_anthropic(tool: ToolSpec) -> dict:
         "name": tool.name,
         "description": tool.description,
         "input_schema": tool.input_schema,
+    }
+
+
+def _tool_call_to_anthropic(call: ToolCall) -> dict:
+    if not call.tool_call_id:
+        raise ProviderAdapterError("Tool call is missing tool_call_id.")
+    return {
+        "type": "tool_use",
+        "id": call.tool_call_id,
+        "name": call.name,
+        "input": call.arguments,
     }
 
 

@@ -61,6 +61,7 @@ class ModelProfile:
     base_url: str
     model_name: str
     credential_ref: CredentialRef | None = None
+    timeout_s: float | None = None
     default_params: dict[str, Any] = field(default_factory=dict)
     capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
     tags: set[str] = field(default_factory=set)
@@ -88,6 +89,7 @@ class CanonicalMessage:
     content: str
     tool_call_id: str | None = None
     tool_name: str | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,7 @@ class LLMResponse:
 
 class LLMStreamEventKind(StrEnum):
     TEXT_DELTA = "text_delta"
+    THINKING_DELTA = "thinking_delta"
     TOOL_CALL_DELTA = "tool_call_delta"
     TOOL_CALL = "tool_call"
     COMPLETED = "completed"
@@ -153,6 +156,7 @@ class ToolCallDelta:
 class LLMStreamEvent:
     kind: LLMStreamEventKind
     text_delta: str | None = None
+    thinking_delta: str | None = None
     tool_call_delta: ToolCallDelta | None = None
     tool_call: ToolCall | None = None
     response: LLMResponse | None = None

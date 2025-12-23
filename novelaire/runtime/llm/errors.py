@@ -7,6 +7,7 @@ from typing import Any
 import anthropic
 import openai
 
+from ..error_codes import ErrorCode
 from .types import ProviderKind
 
 
@@ -37,20 +38,7 @@ class ProviderAdapterError(RuntimeError):
     pass
 
 
-class LLMErrorCode(StrEnum):
-    CANCELLED = "cancelled"
-    TIMEOUT = "timeout"
-    AUTH = "auth"
-    PERMISSION = "permission"
-    RATE_LIMIT = "rate_limit"
-    BAD_REQUEST = "bad_request"
-    NOT_FOUND = "not_found"
-    CONFLICT = "conflict"
-    UNPROCESSABLE = "unprocessable"
-    SERVER_ERROR = "server_error"
-    NETWORK_ERROR = "network_error"
-    RESPONSE_VALIDATION = "response_validation"
-    UNKNOWN = "unknown"
+LLMErrorCode = ErrorCode
 
 
 class CancellationToken:

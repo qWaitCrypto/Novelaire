@@ -4,7 +4,7 @@ from urllib.parse import urljoin, urlparse
 
 from ..errors import ProviderAdapterError
 from ..secrets import resolve_credential
-from ..types import CanonicalMessageRole, CanonicalRequest, ModelProfile, ProviderKind, ToolSpec
+from ..types import CanonicalMessageRole, CanonicalRequest, ModelProfile, ProviderKind, ToolCall, ToolSpec
 from .base import PreparedRequest
 
 
@@ -35,7 +35,10 @@ class OpenAICompatibleAdapter:
             elif msg.role is CanonicalMessageRole.USER:
                 messages.append({"role": "user", "content": msg.content})
             elif msg.role is CanonicalMessageRole.ASSISTANT:
-                messages.append({"role": "assistant", "content": msg.content})
+                payload_msg = {"role": "assistant", "content": msg.content}
+                if msg.tool_calls:
+                    payload_msg["tool_calls"] = [_tool_call_to_openai(tc) for tc in msg.tool_calls]
+                messages.append(payload_msg)
             elif msg.role is CanonicalMessageRole.TOOL:
                 if not msg.tool_call_id:
                     raise ProviderAdapterError("Tool message is missing tool_call_id.")
@@ -65,6 +68,26 @@ def _tool_spec_to_openai(tool: ToolSpec) -> dict:
             "parameters": tool.input_schema,
         },
     }
+
+
+def _tool_call_to_openai(call: ToolCall) -> dict:
+    if not call.tool_call_id:
+        raise ProviderAdapterError("Tool call is missing tool_call_id.")
+    arguments_json = call.raw_arguments if call.raw_arguments is not None else json_dumps(call.arguments)
+    return {
+        "id": call.tool_call_id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": arguments_json,
+        },
+    }
+
+
+def json_dumps(obj: object) -> str:
+    import json
+
+    return json.dumps(obj, ensure_ascii=False)
 
 
 def _validate_base_url(base_url: str, *, requires_v1: bool) -> str:
