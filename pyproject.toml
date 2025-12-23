@@ -12,6 +12,8 @@ license = { file = "LICENSE" }
 dependencies = [
   "anthropic>=0.75.0",
   "openai>=2.14.0",
+  "prompt_toolkit>=3.0.0",
+  "rich>=13.7.0",
 ]
 
 [project.scripts]

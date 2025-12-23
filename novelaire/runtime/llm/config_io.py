@@ -16,6 +16,7 @@ from .types import (
     ProviderKind,
 )
 
+ENV_FILENAME = "env"
 
 def default_global_models_path() -> Path:
     override = os.environ.get("NOVELAIRE_GLOBAL_MODELS_PATH")
@@ -32,6 +33,22 @@ def project_models_path(project_root: Path) -> Path:
             path = project_root / path
         return path
     return project_root / ".novelaire" / "config" / "models.json"
+
+def default_global_env_path() -> Path:
+    override = os.environ.get("NOVELAIRE_GLOBAL_ENV_PATH")
+    if override:
+        return Path(os.path.expanduser(override))
+    return Path.home() / ".novelaire" / "config" / ENV_FILENAME
+
+
+def project_env_path(project_root: Path) -> Path:
+    override = os.environ.get("NOVELAIRE_PROJECT_ENV_PATH")
+    if override:
+        path = Path(os.path.expanduser(override))
+        if not path.is_absolute():
+            path = project_root / path
+        return path
+    return project_root / ".novelaire" / "config" / ENV_FILENAME
 
 
 def discover_project_root(start_dir: Path) -> Path | None:
@@ -65,6 +82,146 @@ def save_model_config_file(path: Path, config: ModelConfig) -> None:
     payload = model_config_to_dict(config)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+def load_model_config_env_file(path: Path) -> ModelConfig:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise ModelConfigError(f"Model env config file not found: {path}") from e
+    except OSError as e:
+        raise ModelConfigError(f"Failed to read model env config file: {path} ({e})") from e
+
+    env = parse_env_text(raw)
+    return load_model_config_from_env(env, source=str(path))
+
+
+def parse_env_text(raw: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[len("export ") :].lstrip()
+        if "=" not in s:
+            raise ModelConfigError(f"Invalid env line (missing '=') at line {line_no}")
+        key, value = s.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ModelConfigError(f"Invalid env line (empty key) at line {line_no}")
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+
+def _maybe_bool_env(value: str | None, *, key: str) -> bool | None:
+    if value is None or value == "":
+        return None
+    v = value.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ModelConfigError(f"Invalid boolean for {key}: {value!r}")
+
+
+def _maybe_float_env(value: str | None, *, key: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError as e:
+        raise ModelConfigError(f"Invalid float for {key}: {value!r}") from e
+
+
+def _maybe_int_env(value: str | None, *, key: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError as e:
+        raise ModelConfigError(f"Invalid integer for {key}: {value!r}") from e
+
+
+def load_model_config_from_env(env: dict[str, str], *, source: str) -> ModelConfig:
+    provider_raw = (env.get("NOVELAIRE_PROVIDER_KIND") or "").strip()
+    if not provider_raw:
+        raise ModelConfigError(
+            f"{source}: missing NOVELAIRE_PROVIDER_KIND (set to 'openai_compatible' or 'anthropic')"
+        )
+    try:
+        provider_kind = ProviderKind(provider_raw)
+    except ValueError as e:
+        raise ModelConfigError(f"{source}: invalid NOVELAIRE_PROVIDER_KIND={provider_raw!r}") from e
+
+    base_url = (env.get("NOVELAIRE_BASE_URL") or "").strip()
+    if not base_url:
+        raise ModelConfigError(f"{source}: missing NOVELAIRE_BASE_URL")
+
+    model_name = (env.get("NOVELAIRE_MODEL") or "").strip()
+    if not model_name:
+        raise ModelConfigError(f"{source}: missing NOVELAIRE_MODEL")
+
+    api_key_raw = env.get("NOVELAIRE_API_KEY")
+    api_key = api_key_raw.strip() if isinstance(api_key_raw, str) else ""
+
+    if provider_kind is ProviderKind.OPENAI_COMPATIBLE:
+        # OpenAI-compatible endpoints are often local/proxied and may not require authentication.
+        # The OpenAI SDK still expects an api_key, so default to a dummy key if none is provided.
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+        elif not os.environ.get("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = "novelaire"
+        credential_ref = CredentialRef(kind="env", identifier="OPENAI_API_KEY")
+    else:
+        # Anthropic requires authentication.
+        if api_key:
+            os.environ["ANTHROPIC_API_KEY"] = api_key
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise ModelConfigError(
+                f"{source}: missing NOVELAIRE_API_KEY (or ANTHROPIC_API_KEY in environment) for provider_kind=anthropic"
+            )
+        credential_ref = CredentialRef(kind="env", identifier="ANTHROPIC_API_KEY")
+
+    timeout_s = _maybe_float_env(env.get("NOVELAIRE_TIMEOUT_S"), key="NOVELAIRE_TIMEOUT_S")
+    if timeout_s is None:
+        timeout_s = 60.0
+    if timeout_s <= 0:
+        raise ModelConfigError(f"{source}: NOVELAIRE_TIMEOUT_S must be > 0")
+    max_tokens = _maybe_int_env(env.get("NOVELAIRE_MAX_TOKENS"), key="NOVELAIRE_MAX_TOKENS")
+
+    default_params: dict[str, Any] = {}
+    if provider_kind is ProviderKind.ANTHROPIC:
+        if max_tokens is None:
+            raise ModelConfigError(f"{source}: NOVELAIRE_MAX_TOKENS is required for provider_kind=anthropic")
+        default_params["max_tokens"] = max_tokens
+    else:
+        if max_tokens is not None:
+            default_params["max_tokens"] = max_tokens
+
+    capabilities = ModelCapabilities(
+        supports_tools=_maybe_bool_env(env.get("NOVELAIRE_SUPPORTS_TOOLS"), key="NOVELAIRE_SUPPORTS_TOOLS"),
+        supports_structured_output=_maybe_bool_env(
+            env.get("NOVELAIRE_SUPPORTS_STRUCTURED_OUTPUT"), key="NOVELAIRE_SUPPORTS_STRUCTURED_OUTPUT"
+        ),
+        supports_streaming=_maybe_bool_env(env.get("NOVELAIRE_SUPPORTS_STREAMING"), key="NOVELAIRE_SUPPORTS_STREAMING"),
+    )
+
+    profile = ModelProfile(
+        profile_id="main",
+        provider_kind=provider_kind,
+        base_url=base_url,
+        model_name=model_name,
+        credential_ref=credential_ref,
+        timeout_s=timeout_s,
+        default_params=default_params,
+        capabilities=capabilities,
+        tags=set(),
+        limits=None,
+    )
+    return ModelConfig(profiles={"main": profile}, role_pointers={ModelRole.MAIN: "main"})
+
 
 def load_model_config_layers_for_dir(
     start_dir: Path | None = None,
@@ -73,11 +230,10 @@ def load_model_config_layers_for_dir(
     require_project: bool = True,
 ) -> ModelConfigLayers:
     start_dir = (start_dir or Path.cwd()).resolve()
-    global_path = global_path or default_global_models_path()
 
     global_cfg = ModelConfig()
-    if global_path.exists():
-        global_cfg = load_model_config_file(global_path)
+    if global_path is not None and global_path.exists():
+        global_cfg = load_model_config_env_file(global_path)
 
     project_root = discover_project_root(start_dir)
     if project_root is None:
@@ -88,16 +244,16 @@ def load_model_config_layers_for_dir(
             )
         return ModelConfigLayers(global_config=global_cfg)
 
-    project_path = project_models_path(project_root)
+    project_path = project_env_path(project_root)
     if not project_path.exists():
         if require_project:
             raise ModelConfigError(
-                f"Missing required project model config file: {project_path}. "
-                "Create it under '.novelaire/config/models.json'."
+                f"Missing required project env config file: {project_path}. "
+                "Run 'novelaire init' and edit '.novelaire/config/env'."
             )
         return ModelConfigLayers(global_config=global_cfg)
 
-    return ModelConfigLayers(global_config=global_cfg, project_config=load_model_config_file(project_path))
+    return ModelConfigLayers(global_config=global_cfg, project_config=load_model_config_env_file(project_path))
 
 
 def load_model_config_dict(data: Any, *, source: str) -> ModelConfig:
@@ -152,6 +308,7 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
             "base_url",
             "model_name",
             "credential_ref",
+            "timeout_s",
             "default_params",
             "capabilities",
             "tags",
@@ -187,6 +344,12 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
         kind = _require_str(cred, "kind", ctx=f"{source}:profiles.{profile_id}.credential_ref")
         ident = _require_str(cred, "identifier", ctx=f"{source}:profiles.{profile_id}.credential_ref")
         credential_ref = CredentialRef(kind=kind, identifier=ident)
+
+    timeout_s = None
+    if "timeout_s" in profile_dict and profile_dict["timeout_s"] is not None:
+        timeout_s = _maybe_float(profile_dict["timeout_s"], ctx=f"{source}:profiles.{profile_id}.timeout_s")
+        if timeout_s <= 0:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}.timeout_s must be > 0")
 
     default_params: dict[str, Any] = {}
     if "default_params" in profile_dict and profile_dict["default_params"] is not None:
@@ -247,6 +410,7 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
         base_url=base_url,
         model_name=model_name,
         credential_ref=credential_ref,
+        timeout_s=timeout_s,
         default_params=default_params,
         capabilities=capabilities,
         tags=tags,
@@ -265,6 +429,8 @@ def _profile_to_dict(profile: ModelProfile) -> dict[str, Any]:
             "kind": profile.credential_ref.kind,
             "identifier": profile.credential_ref.identifier,
         }
+    if profile.timeout_s is not None:
+        out["timeout_s"] = profile.timeout_s
     if profile.default_params:
         out["default_params"] = dict(profile.default_params)
 
@@ -323,6 +489,16 @@ def _maybe_int(value: Any, *, ctx: str) -> int | None:
     if isinstance(value, int):
         return value
     raise ModelConfigError(f"{ctx} must be an integer or null")
+
+
+def _maybe_float(value: Any, *, ctx: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ModelConfigError(f"{ctx} must be a number or null")
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise ModelConfigError(f"{ctx} must be a number or null")
 
 
 def _assert_known_keys(obj: dict[str, Any], *, allowed: set[str], ctx: str) -> None:
