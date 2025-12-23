@@ -47,8 +47,14 @@ class ModelCapabilities:
             ProviderKind.ANTHROPIC,
         ):
             supports_streaming = True
+        supports_tools = self.supports_tools
+        if supports_tools is None and provider_kind in (
+            ProviderKind.OPENAI_COMPATIBLE,
+            ProviderKind.ANTHROPIC,
+        ):
+            supports_tools = True
         return ModelCapabilities(
-            supports_tools=self.supports_tools,
+            supports_tools=supports_tools,
             supports_structured_output=self.supports_structured_output,
             supports_streaming=supports_streaming,
         )

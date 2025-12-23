@@ -29,13 +29,25 @@ from .llm.types import (
 from .tools import (
     InspectionDecision,
     ProjectReadTextTool,
+    ProjectSearchTextTool,
+    ProjectTextEditorTool,
     ProjectWriteTextTool,
     PlannedToolCall,
+    ShellRunTool,
     ToolExecutionResult,
     ToolRegistry,
     ToolRuntime,
     ToolRuntimeError,
 )
+
+DEFAULT_SYSTEM_PROMPT = """You are Novelaire, a local CLI assistant for a writing project.
+
+You may be provided with a set of tools. Use tools when you need to inspect or change project files.
+Never claim you can browse the internet or accept file uploads. You can only access files via the provided tools.
+
+When asked what tools you can use, list the available tool names and briefly explain what each does.
+Do not invent tools. If tools are not provided, say tool calling is disabled and ask the user to paste content instead.
+"""
 
 
 @dataclass(slots=True)
@@ -70,10 +82,14 @@ class Orchestrator:
         system_prompt: str | None = None,
         tools_enabled: bool = False,
     ) -> "Orchestrator":
+        effective_system_prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
         router = ModelRouter(model_config)
         registry = ToolRegistry()
         registry.register(ProjectReadTextTool())
         registry.register(ProjectWriteTextTool())
+        registry.register(ProjectTextEditorTool())
+        registry.register(ProjectSearchTextTool())
+        registry.register(ShellRunTool())
         tool_runtime = ToolRuntime(project_root=project_root, registry=registry, artifact_store=artifact_store)
         return Orchestrator(
             project_root=project_root,
@@ -88,7 +104,7 @@ class Orchestrator:
             tools_enabled=tools_enabled,
             tool_registry=registry,
             tool_runtime=tool_runtime,
-            system_prompt=system_prompt,
+            system_prompt=effective_system_prompt,
             _history=[],
         )
 

@@ -14,6 +14,8 @@ from .runtime.approval import ApprovalStatus
 from .runtime.protocol import ArtifactRef, EventKind, Op, OpKind
 from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
 from .runtime.llm.config_io import load_model_config_layers_for_dir
+from .runtime.llm.types import ModelRole
+from .runtime.tools.runtime import ToolApprovalMode
 from .runtime.validate import validate_bundle_dir, validate_project_session
 
 EXIT_OK = 0
@@ -101,11 +103,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional system prompt override.",
     )
     chat_parser.add_argument(
-        "--tools",
+        "--no-tools",
         dest="enable_tools",
-        action="store_true",
-        help="Enable tool calling (requires model profile supports_tools=true).",
+        action="store_false",
+        help="Disable tool calling.",
     )
+    chat_parser.set_defaults(enable_tools=None)
     chat_parser.set_defaults(func=_cmd_chat)
 
     session_parser = subparsers.add_parser("session", help="Manage sessions.")
@@ -128,11 +131,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional system prompt override.",
     )
     session_resume_parser.add_argument(
-        "--tools",
+        "--no-tools",
         dest="enable_tools",
-        action="store_true",
-        help="Enable tool calling (requires model profile supports_tools=true).",
+        action="store_false",
+        help="Disable tool calling.",
     )
+    session_resume_parser.set_defaults(enable_tools=None)
     session_resume_parser.set_defaults(func=_cmd_session_resume)
 
     debug_parser = subparsers.add_parser("debug", help="Debug utilities.")
@@ -189,20 +193,40 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
+    enable_tools = getattr(args, "enable_tools", None)
+    if enable_tools is None:
+        profile = model_config.get_profile_for_role(ModelRole.MAIN)
+        if profile is None:
+            enable_tools = False
+        else:
+            caps = profile.capabilities.with_provider_defaults(profile.provider_kind)
+            enable_tools = caps.supports_tools is True
+
+    default_approval_mode = ToolApprovalMode.STRICT
     session_id = args.session_id
     if session_id is None:
         session_id = session_store.create_session(
             {
                 "project_ref": str(paths.project_root),
                 "mode": "chat",
+                "tool_approval_mode": default_approval_mode.value,
             }
         )
+        session_meta = session_store.get_session(session_id)
     else:
         try:
-            session_store.get_session(session_id)
+            session_meta = session_store.get_session(session_id)
         except FileNotFoundError as e:
             print(str(e), file=sys.stderr)
             return EXIT_CONFIG_ERROR
+
+    raw_mode = session_meta.get("tool_approval_mode")
+    try:
+        approval_mode = ToolApprovalMode(str(raw_mode)) if raw_mode else default_approval_mode
+    except ValueError:
+        approval_mode = default_approval_mode
+    if session_meta.get("tool_approval_mode") != approval_mode.value:
+        session_store.update_session(session_id, {"tool_approval_mode": approval_mode.value})
 
     orchestrator = Orchestrator.for_session(
         project_root=paths.project_root,
@@ -214,8 +238,10 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         approval_store=approval_store,
         model_config=model_config,
         system_prompt=args.system_prompt,
-        tools_enabled=bool(getattr(args, "enable_tools", False)),
+        tools_enabled=bool(enable_tools),
     )
+    if orchestrator.tool_runtime is not None:
+        orchestrator.tool_runtime.set_approval_mode(approval_mode)
     orchestrator.load_history_from_events()
 
     return _run_chat_line_mode(
@@ -288,7 +314,7 @@ def _run_chat_console_ui(
             from prompt_toolkit.keys import Keys
 
             class _SlashCompleter(Completer):
-                _cmds = ["/help", "/clear", "/exit", "/quit"]
+                _cmds = ["/help", "/clear", "/perm", "/exit", "/quit"]
 
                 def get_completions(self, document, complete_event):
                     text = document.text_before_cursor
@@ -468,12 +494,65 @@ def _run_chat_console_ui(
             ui.emit(
                 UIEvent(
                     UIEventKind.LOG,
-                    {"level": "help", "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /exit quits."},
+                    {
+                        "level": "help",
+                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /exit quits.",
+                    },
                 )
             )
             continue
         if cmd == "/clear":
             ui.emit(UIEvent(UIEventKind.CLEAR_SCREEN, {}))
+            continue
+        if cmd.startswith("/perm"):
+            parts = cmd.split()
+            tr = orchestrator.tool_runtime
+            if tr is None:
+                ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Tool runtime not available."}))
+                continue
+            if len(parts) == 1:
+                mode = tr.get_approval_mode().value
+                ui.emit(
+                    UIEvent(
+                        UIEventKind.LOG,
+                        {
+                            "level": "policy",
+                            "message": (
+                                f"Tool approval mode: {mode}\n"
+                                "Modes:\n"
+                                "  strict   - approval required for every tool call\n"
+                                "  standard - approval required only for shell commands\n"
+                                "  trusted  - no approvals (dangerous)"
+                            ),
+                        },
+                    )
+                )
+                continue
+
+            raw = parts[1].strip().lower()
+            desired: ToolApprovalMode | None = None
+            if raw in {"strict", "all", "always", "ask_all", "paranoid"}:
+                desired = ToolApprovalMode.STRICT
+            elif raw in {"standard", "safe", "default", "ask_risky", "risky"}:
+                desired = ToolApprovalMode.STANDARD
+            elif raw in {"trusted", "auto", "none", "off", "no"}:
+                desired = ToolApprovalMode.TRUSTED
+
+            if desired is None:
+                ui.emit(
+                    UIEvent(
+                        UIEventKind.WARNING,
+                        {"message": "Usage: /perm [strict|standard|trusted]"},
+                    )
+                )
+                continue
+
+            tr.set_approval_mode(desired)
+            try:
+                orchestrator.session_store.update_session(orchestrator.session_id, {"tool_approval_mode": desired.value})
+            except Exception:
+                pass
+            ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Tool approval mode set to: {desired.value}"}))
             continue
 
         try:
@@ -637,7 +716,7 @@ def _cmd_session_resume(args: argparse.Namespace) -> int:
         session_id=args.session_id,
         timeout_s=args.timeout_s,
         system_prompt=args.system_prompt,
-        enable_tools=getattr(args, "enable_tools", False),
+        enable_tools=getattr(args, "enable_tools", None),
     )
     return _cmd_chat(args2)
 
@@ -1013,6 +1092,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     "NOVELAIRE_MODEL=your-model-name",
                     "# NOVELAIRE_API_KEY=replace-me  # optional for many local/proxied endpoints",
                     "NOVELAIRE_TIMEOUT_S=60",
+                    "NOVELAIRE_SUPPORTS_TOOLS=1",
                     "",
                     "# --- Anthropic example ---",
                     "# NOVELAIRE_PROVIDER_KIND=anthropic",
@@ -1020,6 +1100,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     "# NOVELAIRE_MODEL=claude-3-5-sonnet-20241022",
                     "# NOVELAIRE_API_KEY=replace-me",
                     "# NOVELAIRE_MAX_TOKENS=1024",
+                    "# NOVELAIRE_SUPPORTS_TOOLS=1",
                     "",
                 ]
             )
