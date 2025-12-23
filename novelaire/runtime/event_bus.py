@@ -33,6 +33,12 @@ class EventBus:
         self._event_log_store = event_log_store
         self._next_sub_id = 1
         self._subs: dict[int, tuple[EventHandler, EventFilter]] = {}
+        # Events that are useful for live UI but should not be persisted in the event log.
+        # We only persist the final `llm_response_completed` (which points at an artifact).
+        self._ephemeral_kinds = {
+            EventKind.LLM_RESPONSE_DELTA.value,
+            EventKind.LLM_THINKING_DELTA.value,
+        }
         self._mergeable_kinds = {
             EventKind.OPERATION_PROGRESS.value,
             EventKind.TOOL_CALL_PROGRESS.value,
@@ -90,6 +96,9 @@ class EventBus:
             return
 
         self.flush(session_id=event.session_id)
+        if event.kind in self._ephemeral_kinds:
+            self._dispatch(event)
+            return
         self._append_and_dispatch(event)
 
     def _notify_append_failed(self, event: Event, exc: BaseException) -> None:
