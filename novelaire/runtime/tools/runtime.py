@@ -123,6 +123,15 @@ class ToolRuntime:
                 error_code=ErrorCode.TOOL_UNKNOWN,
             )
 
+        # Domain invariants / mandatory approvals (override all modes).
+        sealed = self._is_spec_sealed()
+        sealed_violation = self._check_sealed_spec_violation(planned, sealed=sealed)
+        if sealed_violation is not None:
+            return sealed_violation
+
+        if planned.tool_name in {"spec__apply", "spec__seal"}:
+            return self._inspect_spec_workflow(planned)
+
         if self._approval_mode is ToolApprovalMode.TRUSTED:
             return InspectionResult(
                 decision=InspectionDecision.ALLOW,
@@ -164,6 +173,112 @@ class ToolRuntime:
             risk_level="low",
             reason=None,
             error_code=None,
+            diff_ref=None,
+        )
+
+    def _is_spec_sealed(self) -> bool:
+        import json
+
+        path = self._project_root / ".novelaire" / "state" / "spec_state.json"
+        if not path.exists():
+            return False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        return str(raw.get("status") or "") == "sealed"
+
+    def _check_sealed_spec_violation(self, planned: PlannedToolCall, *, sealed: bool) -> InspectionResult | None:
+        if not sealed:
+            return None
+        tool_name = planned.tool_name
+        if tool_name == "project__write_text":
+            path = planned.arguments.get("path")
+            if isinstance(path, str) and _is_under_spec_dir(path):
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked write to sealed spec/",
+                    risk_level="high",
+                    reason="Spec is sealed; do not modify spec/ via generic file tools. Use spec workflow tools.",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=None,
+                )
+        if tool_name == "project__text_editor":
+            command = planned.arguments.get("command")
+            path = planned.arguments.get("path")
+            if isinstance(command, str) and command != "view" and isinstance(path, str) and _is_under_spec_dir(path):
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked edit to sealed spec/",
+                    risk_level="high",
+                    reason="Spec is sealed; do not modify spec/ via generic file tools. Use spec workflow tools.",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=None,
+                )
+        return None
+
+    def _inspect_spec_workflow(self, planned: PlannedToolCall) -> InspectionResult:
+        tool_name = planned.tool_name
+        if tool_name == "spec__apply":
+            proposal_id = planned.arguments.get("proposal_id")
+            diff_ref = None
+            reason = None
+            if isinstance(proposal_id, str) and proposal_id:
+                try:
+                    record = _load_spec_proposal_record(self._project_root, proposal_id)
+                    reason_raw = record.get("reason")
+                    if isinstance(reason_raw, str) and reason_raw.strip():
+                        reason = reason_raw.strip()
+                    raw_ref = record.get("diff_ref")
+                    if isinstance(raw_ref, dict):
+                        diff_ref = ArtifactRef.from_dict(raw_ref)
+                except Exception:
+                    diff_ref = self._build_args_preview(planned, summary="Preview for spec__apply (proposal diff unavailable)")
+            else:
+                diff_ref = self._build_args_preview(planned, summary="Preview for spec__apply (missing proposal_id)")
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=f"Apply spec proposal: {proposal_id}",
+                risk_level="high",
+                reason=reason or "Applying a spec proposal modifies author-visible spec/ files.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
+        if tool_name == "spec__seal":
+            label = planned.arguments.get("label")
+            preview = (
+                "Seal spec into a version label.\n\n"
+                "This will create an internal snapshot (git) and mark spec as sealed.\n"
+                "Default snapshot exclusions:\n"
+                "- .novelaire/state/git\n"
+                "- .novelaire/cache\n"
+                "- .novelaire/index\n"
+                "- .novelaire/tmp\n"
+                "- .novelaire/events\n"
+                "- .novelaire/sessions\n"
+                "- .novelaire/artifacts\n"
+            )
+            if isinstance(label, str) and label.strip():
+                preview = f"Label: {label.strip()}\n\n" + preview
+            diff_ref = self._artifact_store.put(preview, kind="diff", meta={"summary": "Spec seal preview"})
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=f"Seal spec: {label}",
+                risk_level="high",
+                reason="Sealing spec creates a version point and makes spec read-only.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
+        return InspectionResult(
+            decision=InspectionDecision.DENY,
+            action_summary=f"Unknown spec workflow tool: {tool_name}",
+            risk_level="high",
+            reason="Unsupported spec workflow operation.",
+            error_code=ErrorCode.TOOL_UNKNOWN,
             diff_ref=None,
         )
 
@@ -492,3 +607,19 @@ def _classify_tool_exception(exc: BaseException) -> ErrorCode:
     if isinstance(exc, OSError):
         return ErrorCode.UNKNOWN
     return ErrorCode.UNKNOWN
+
+
+def _is_under_spec_dir(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("/")
+    return normalized == "spec" or normalized.startswith("spec/")
+
+
+def _load_spec_proposal_record(project_root: Path, proposal_id: str) -> dict[str, Any]:
+    import json
+
+    root = project_root / ".novelaire" / "state" / "spec" / "proposals"
+    path = root / f"{proposal_id}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid proposal record.")
+    return raw

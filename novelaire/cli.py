@@ -15,6 +15,7 @@ from .runtime.protocol import ArtifactRef, EventKind, Op, OpKind
 from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
 from .runtime.llm.config_io import load_model_config_layers_for_dir
 from .runtime.llm.types import ModelRole
+from .runtime.skills import seed_builtin_skills
 from .runtime.tools.runtime import ToolApprovalMode
 from .runtime.validate import validate_bundle_dir, validate_project_session
 
@@ -921,6 +922,19 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         )
         return out
 
+    if kind == EventKind.PLAN_UPDATE.value:
+        out.append(
+            UIEvent(
+                UIEventKind.PLAN_UPDATED,
+                {
+                    "plan": payload.get("plan") if isinstance(payload.get("plan"), list) else [],
+                    "explanation": payload.get("explanation"),
+                    "updated_at": payload.get("updated_at"),
+                },
+            )
+        )
+        return out
+
     if kind == EventKind.OPERATION_PROGRESS.value:
         msg = payload.get("message")
         if msg:
@@ -939,12 +953,25 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         return out
 
     if kind == EventKind.LLM_REQUEST_FAILED.value:
+        msg = payload.get("error") or str(payload)
+        code = payload.get("error_code") or payload.get("code") or "llm_request_failed"
+        details = payload.get("details")
+        if code == "timeout" and isinstance(details, dict):
+            phase = details.get("phase")
+            timeout_s = details.get("timeout_s")
+            extras: list[str] = []
+            if phase:
+                extras.append(f"phase={phase}")
+            if timeout_s is not None:
+                extras.append(f"timeout_s={timeout_s}")
+            if extras:
+                msg = f"{msg} ({', '.join(extras)})"
         out.append(
             UIEvent(
                 UIEventKind.ERROR_RAISED,
                 {
-                    "code": payload.get("error_code") or payload.get("code") or "llm_request_failed",
-                    "message": payload.get("error") or str(payload),
+                    "code": code,
+                    "message": msg,
                     "recoverable": bool(payload.get("retryable", True)),
                 },
             )
@@ -952,6 +979,9 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         return out
 
     if kind == EventKind.OPERATION_FAILED.value:
+        # Avoid duplicate error lines for LLM failures: LLM_REQUEST_FAILED already surfaced it.
+        if payload.get("type") == "llm_request":
+            return out
         out.append(
             UIEvent(
                 UIEventKind.ERROR_RAISED,
@@ -1048,12 +1078,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
         project_root / "drafts",
         project_root / "refs" / "style",
         project_root / "refs" / "research",
-        project_root / "skills",
         project_root / "recipes",
     ]
     system_dirs = [
         project_root / ".novelaire" / "config",
         project_root / ".novelaire" / "policy",
+        project_root / ".novelaire" / "skills",
         project_root / ".novelaire" / "sessions",
         project_root / ".novelaire" / "events",
         project_root / ".novelaire" / "artifacts",
@@ -1085,6 +1115,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     "#   NOVELAIRE_TIMEOUT_S       = per-request timeout seconds",
                     "#   NOVELAIRE_MAX_TOKENS      = max output tokens (REQUIRED for anthropic)",
                     "#   NOVELAIRE_SUPPORTS_TOOLS  = 0/1",
+                    "#   NOVELAIRE_TRACE_LLM       = 0/1 (write LLM request/response traces for debugging)",
+                    "#   NOVELAIRE_TRACE_LLM_DIR   = optional override directory for traces",
                     "",
                     "# --- OpenAI-compatible example (vLLM/TGI/llama.cpp/OpenAI/OpenRouter proxy etc.) ---",
                     "NOVELAIRE_PROVIDER_KIND=openai_compatible",
@@ -1093,6 +1125,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     "# NOVELAIRE_API_KEY=replace-me  # optional for many local/proxied endpoints",
                     "NOVELAIRE_TIMEOUT_S=60",
                     "NOVELAIRE_SUPPORTS_TOOLS=1",
+                    "# NOVELAIRE_TRACE_LLM=0",
                     "",
                     "# --- Anthropic example ---",
                     "# NOVELAIRE_PROVIDER_KIND=anthropic",
@@ -1101,12 +1134,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     "# NOVELAIRE_API_KEY=replace-me",
                     "# NOVELAIRE_MAX_TOKENS=1024",
                     "# NOVELAIRE_SUPPORTS_TOOLS=1",
+                    "# NOVELAIRE_TRACE_LLM=0",
                     "",
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
+
+    skipped = seed_builtin_skills(project_root=project_root)
+    if skipped:
+        print("Skipped seeding existing skills:")
+        for path in skipped:
+            print(f"  - {path}")
 
     print(f"Initialized Novelaire project at {project_root}")
     return EXIT_OK

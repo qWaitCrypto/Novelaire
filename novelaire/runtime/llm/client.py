@@ -25,6 +25,7 @@ from .providers.anthropic import AnthropicAdapter
 from .providers.openai_compatible import OpenAICompatibleAdapter
 from .router import ModelRouter
 from .secrets import resolve_credential
+from .trace import LLMTrace
 from .types import (
     CanonicalRequest,
     LLMResponse,
@@ -142,7 +143,7 @@ def _start_stream_idle_watchdog(
     cancel: CancellationToken | None,
     first_event_timeout_s: float | None,
     idle_timeout_s: float | None,
-) -> tuple[threading.Event, threading.Event, callable]:
+) -> tuple[threading.Event, threading.Event, callable, callable]:
     """
     Best-effort guard for buggy "streaming" endpoints that never send a terminal event / never close.
 
@@ -156,11 +157,16 @@ def _start_stream_idle_watchdog(
     lock = threading.Lock()
     last_progress = [time.monotonic()]
     saw_any = [False]
+    phase: list[str | None] = [None]
 
     def tick() -> None:
         with lock:
             last_progress[0] = time.monotonic()
             saw_any[0] = True
+
+    def timed_out_phase() -> str | None:
+        with lock:
+            return phase[0]
 
     def _run() -> None:
         started = time.monotonic()
@@ -172,6 +178,8 @@ def _start_stream_idle_watchdog(
                 last = last_progress[0]
                 any_seen = saw_any[0]
             if (not any_seen) and first_event_timeout_s is not None and (now - started) >= first_event_timeout_s:
+                with lock:
+                    phase[0] = "first_event"
                 timed_out.set()
                 try:
                     _maybe_close_stream(stream)
@@ -179,6 +187,8 @@ def _start_stream_idle_watchdog(
                     pass
                 return
             if any_seen and idle_timeout_s is not None and (now - last) >= idle_timeout_s:
+                with lock:
+                    phase[0] = "idle"
                 timed_out.set()
                 try:
                     _maybe_close_stream(stream)
@@ -189,7 +199,7 @@ def _start_stream_idle_watchdog(
 
     t = threading.Thread(target=_run, name="novelaire-llm-stream-idle", daemon=True)
     t.start()
-    return stop, timed_out, tick
+    return stop, timed_out, tick, timed_out_phase
 
 
 @dataclass
@@ -210,7 +220,12 @@ class _OpenAIToolCallBuilder:
         try:
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError as e:
-            raise ProviderAdapterError(f"OpenAI tool call arguments are not valid JSON: {e}") from e
+            snippet = raw.replace("\r", "\\r").replace("\n", "\\n")
+            if len(snippet) > 240:
+                snippet = snippet[:240] + f"... (+{len(raw) - 240} chars)"
+            raise ProviderAdapterError(
+                f"OpenAI tool call '{self.name}' arguments are not valid JSON: {e}; raw={snippet!r}"
+            ) from e
         if not isinstance(parsed, dict):
             raise ProviderAdapterError("OpenAI tool call arguments must be a JSON object.")
         return ToolCall(tool_call_id=self.tool_call_id, name=self.name, arguments=parsed, raw_arguments=raw)
@@ -256,6 +271,7 @@ class LLMClient:
         request: CanonicalRequest,
         timeout_s: float | None = None,
         cancel: CancellationToken | None = None,
+        trace: LLMTrace | None = None,
     ) -> LLMResponse:
         if requirements.needs_streaming:
             raise ProviderAdapterError("complete() does not support needs_streaming=True; use stream().")
@@ -263,6 +279,8 @@ class LLMClient:
         effective = _merge_requirements(requirements, request=request, force_streaming=False)
         resolved = self._router.resolve(role=role, requirements=effective)
         profile = resolved.profile
+        if trace is not None:
+            trace.record_canonical_request(request)
         _raise_if_cancelled(
             cancel,
             provider_kind=profile.provider_kind,
@@ -305,6 +323,16 @@ class LLMClient:
             client = OpenAI(api_key=api_key, base_url=profile.base_url, max_retries=0)
             payload = OpenAICompatibleAdapter().prepare_request(profile, request).json
             request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=False,
+                    timeout_s=request_timeout_s,
+                    payload=payload,
+                )
             try:
                 if request_timeout_s is not None:
                     resp = client.chat.completions.create(**payload, timeout=request_timeout_s)
@@ -329,6 +357,8 @@ class LLMClient:
                     details={"operation": "complete"},
                     cause=e,
                 ) from e
+            if trace is not None:
+                trace.write_json("provider_response.json", resp)
             return _openai_to_response(profile_id=profile.profile_id, resp=resp)
 
         if profile.provider_kind is ProviderKind.ANTHROPIC:
@@ -369,6 +399,16 @@ class LLMClient:
                     "Anthropic requests require 'max_tokens' (set in profile.default_params or request.params)."
                 )
             request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=False,
+                    timeout_s=request_timeout_s,
+                    payload=payload,
+                )
             try:
                 if request_timeout_s is not None:
                     resp = client.messages.create(**payload, timeout=request_timeout_s)
@@ -393,6 +433,8 @@ class LLMClient:
                     details={"operation": "complete"},
                     cause=e,
                 ) from e
+            if trace is not None:
+                trace.write_json("provider_response.json", resp)
             return _anthropic_to_response(profile_id=profile.profile_id, resp=resp)
 
         raise ProviderAdapterError(f"Unsupported provider_kind: {profile.provider_kind}")
@@ -405,10 +447,13 @@ class LLMClient:
         request: CanonicalRequest,
         timeout_s: float | None = None,
         cancel: CancellationToken | None = None,
+        trace: LLMTrace | None = None,
     ) -> Iterator[LLMStreamEvent]:
         effective = _merge_requirements(requirements, request=request, force_streaming=True)
         resolved = self._router.resolve(role=role, requirements=effective)
         profile = resolved.profile
+        if trace is not None:
+            trace.record_canonical_request(request)
         _raise_if_cancelled(
             cancel,
             provider_kind=profile.provider_kind,
@@ -451,14 +496,25 @@ class LLMClient:
             client = OpenAI(api_key=api_key, base_url=profile.base_url, max_retries=0)
             payload = OpenAICompatibleAdapter().prepare_request(profile, request).json
             request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=True,
+                    timeout_s=request_timeout_s,
+                    payload=payload,
+                )
             timeout_arg: Any | None = None
             if request_timeout_s is not None:
-                # Some OpenAI-compatible gateways stall mid-stream. A shorter *read* timeout prevents
-                # the CLI from hanging forever waiting for the next SSE chunk.
+                # Some OpenAI-compatible gateways stall mid-stream. Keep the SDK's socket read
+                # timeout aligned with the configured request timeout so users can tune it via
+                # `NOVELAIRE_TIMEOUT_S` / `--timeout`.
                 try:
                     import httpx  # type: ignore
 
-                    read_timeout_s = min(8.0, float(request_timeout_s))
+                    read_timeout_s = float(request_timeout_s)
                     timeout_arg = httpx.Timeout(float(request_timeout_s), read=read_timeout_s)
                 except Exception:
                     timeout_arg = float(request_timeout_s)
@@ -488,19 +544,15 @@ class LLMClient:
                     details={"operation": "stream"},
                     cause=e,
                 ) from e
-
+    
             stop_closer = _start_cancel_closer(cancel, raw_stream)
-            wd_stop, wd_timed_out, wd_tick = _start_stream_idle_watchdog(
+            wd_stop, wd_timed_out, wd_tick, wd_phase = _start_stream_idle_watchdog(
                 stream=raw_stream,
                 cancel=cancel,
-                first_event_timeout_s=(
-                    None
-                    if request_timeout_s is None
-                    else min(30.0, max(5.0, float(request_timeout_s) * 0.5))
-                ),
+                first_event_timeout_s=(None if request_timeout_s is None else float(request_timeout_s)),
                 # After the first chunk, token streams should stay "chatty". If we go silent,
                 # close the stream so the CLI doesn't hang forever on buggy endpoints.
-                idle_timeout_s=(None if request_timeout_s is None else min(8.0, float(request_timeout_s))),
+                idle_timeout_s=(None if request_timeout_s is None else float(request_timeout_s)),
             )
             try:
                 for event in _openai_stream_to_events(
@@ -508,6 +560,7 @@ class LLMClient:
                     stream=raw_stream,
                     timeout_flag=wd_timed_out,
                     on_chunk=wd_tick,
+                    on_provider_chunk=(None if trace is None else trace.record_provider_item),
                 ):
                     _raise_if_cancelled(
                         cancel,
@@ -516,17 +569,35 @@ class LLMClient:
                         model=profile.model_name,
                         operation="stream",
                     )
+                    if trace is not None:
+                        trace.record_stream_event(event)
                     yield event
                 if wd_timed_out.is_set():
+                    phase = wd_phase()
                     raise LLMRequestError(
-                        "Stream timed out (no terminal event / idle).",
+                        (
+                            "Stream timed out waiting for first stream chunk."
+                            if phase == "first_event"
+                            else "Stream timed out (no terminal event / idle)."
+                        ),
                         code=LLMErrorCode.TIMEOUT,
                         provider_kind=profile.provider_kind,
                         profile_id=profile.profile_id,
                         model=profile.model_name,
                         retryable=True,
-                        details={"operation": "stream", "timeout_s": request_timeout_s},
+                        details={"operation": "stream", "timeout_s": request_timeout_s, "phase": phase},
                     )
+            except ProviderAdapterError as e:
+                raise LLMRequestError(
+                    str(e),
+                    code=LLMErrorCode.RESPONSE_VALIDATION,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    retryable=True,
+                    details={"operation": "stream", "phase": "response_parse"},
+                    cause=e,
+                ) from e
             except openai.OpenAIError as e:
                 if cancel is not None and cancel.cancelled:
                     raise LLMRequestError(
@@ -540,14 +611,19 @@ class LLMClient:
                         cause=e,
                     ) from e
                 if wd_timed_out.is_set():
+                    phase = wd_phase()
                     raise LLMRequestError(
-                        "Stream timed out (no terminal event / idle).",
+                        (
+                            "Stream timed out waiting for first stream chunk."
+                            if phase == "first_event"
+                            else "Stream timed out (no terminal event / idle)."
+                        ),
                         code=LLMErrorCode.TIMEOUT,
                         provider_kind=profile.provider_kind,
                         profile_id=profile.profile_id,
                         model=profile.model_name,
                         retryable=True,
-                        details={"operation": "stream", "timeout_s": request_timeout_s},
+                        details={"operation": "stream", "timeout_s": request_timeout_s, "phase": phase},
                         cause=e,
                     ) from e
                 raise wrap_provider_exception(
@@ -602,12 +678,22 @@ class LLMClient:
                     "Anthropic requests require 'max_tokens' (set in profile.default_params or request.params)."
                 )
             request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=True,
+                    timeout_s=request_timeout_s,
+                    payload=payload,
+                )
             timeout_arg: Any | None = None
             if request_timeout_s is not None:
                 try:
                     import httpx  # type: ignore
 
-                    read_timeout_s = min(8.0, float(request_timeout_s))
+                    read_timeout_s = float(request_timeout_s)
                     timeout_arg = httpx.Timeout(float(request_timeout_s), read=read_timeout_s)
                 except Exception:
                     timeout_arg = float(request_timeout_s)
@@ -635,17 +721,13 @@ class LLMClient:
                     details={"operation": "stream"},
                     cause=e,
                 ) from e
-
+    
             stop_closer = _start_cancel_closer(cancel, raw_stream)
-            wd_stop, wd_timed_out, wd_tick = _start_stream_idle_watchdog(
+            wd_stop, wd_timed_out, wd_tick, wd_phase = _start_stream_idle_watchdog(
                 stream=raw_stream,
                 cancel=cancel,
-                first_event_timeout_s=(
-                    None
-                    if request_timeout_s is None
-                    else min(30.0, max(5.0, float(request_timeout_s) * 0.5))
-                ),
-                idle_timeout_s=(None if request_timeout_s is None else min(8.0, float(request_timeout_s))),
+                first_event_timeout_s=(None if request_timeout_s is None else float(request_timeout_s)),
+                idle_timeout_s=(None if request_timeout_s is None else float(request_timeout_s)),
             )
             try:
                 for event in _anthropic_stream_to_events(
@@ -653,6 +735,7 @@ class LLMClient:
                     stream=raw_stream,
                     timeout_flag=wd_timed_out,
                     on_event=wd_tick,
+                    on_provider_event=(None if trace is None else trace.record_provider_item),
                 ):
                     _raise_if_cancelled(
                         cancel,
@@ -661,17 +744,35 @@ class LLMClient:
                         model=profile.model_name,
                         operation="stream",
                     )
+                    if trace is not None:
+                        trace.record_stream_event(event)
                     yield event
                 if wd_timed_out.is_set():
+                    phase = wd_phase()
                     raise LLMRequestError(
-                        "Stream timed out (no terminal event / idle).",
+                        (
+                            "Stream timed out waiting for first stream chunk."
+                            if phase == "first_event"
+                            else "Stream timed out (no terminal event / idle)."
+                        ),
                         code=LLMErrorCode.TIMEOUT,
                         provider_kind=profile.provider_kind,
                         profile_id=profile.profile_id,
                         model=profile.model_name,
                         retryable=True,
-                        details={"operation": "stream", "timeout_s": request_timeout_s},
+                        details={"operation": "stream", "timeout_s": request_timeout_s, "phase": phase},
                     )
+            except ProviderAdapterError as e:
+                raise LLMRequestError(
+                    str(e),
+                    code=LLMErrorCode.RESPONSE_VALIDATION,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    retryable=True,
+                    details={"operation": "stream", "phase": "response_parse"},
+                    cause=e,
+                ) from e
             except anthropic.AnthropicError as e:
                 if cancel is not None and cancel.cancelled:
                     raise LLMRequestError(
@@ -685,14 +786,19 @@ class LLMClient:
                         cause=e,
                     ) from e
                 if wd_timed_out.is_set():
+                    phase = wd_phase()
                     raise LLMRequestError(
-                        "Stream timed out (no terminal event / idle).",
+                        (
+                            "Stream timed out waiting for first stream chunk."
+                            if phase == "first_event"
+                            else "Stream timed out (no terminal event / idle)."
+                        ),
                         code=LLMErrorCode.TIMEOUT,
                         provider_kind=profile.provider_kind,
                         profile_id=profile.profile_id,
                         model=profile.model_name,
                         retryable=True,
-                        details={"operation": "stream", "timeout_s": request_timeout_s},
+                        details={"operation": "stream", "timeout_s": request_timeout_s, "phase": phase},
                         cause=e,
                     ) from e
                 raise wrap_provider_exception(
@@ -761,6 +867,7 @@ def _openai_stream_to_events(
     stream: Any,
     timeout_flag: threading.Event | None = None,
     on_chunk: callable | None = None,
+    on_provider_chunk: callable | None = None,
 ) -> Iterator[LLMStreamEvent]:
     text_parts: list[str] = []
     tool_builders: dict[int, _OpenAIToolCallBuilder] = {}
@@ -771,6 +878,16 @@ def _openai_stream_to_events(
 
     try:
         for chunk in stream:
+            if on_provider_chunk is not None:
+                try:
+                    on_provider_chunk(chunk)
+                except Exception:
+                    pass
+            if on_chunk is not None:
+                try:
+                    on_chunk()
+                except Exception:
+                    pass
             if request_id is None:
                 request_id = getattr(chunk, "id", None)
             if model is None:
@@ -780,11 +897,6 @@ def _openai_stream_to_events(
 
             if not chunk.choices:
                 continue
-            if on_chunk is not None:
-                try:
-                    on_chunk()
-                except Exception:
-                    pass
             choice0 = chunk.choices[0]
             delta = choice0.delta
 
@@ -911,6 +1023,7 @@ def _anthropic_stream_to_events(
     stream: Any,
     timeout_flag: threading.Event | None = None,
     on_event: callable | None = None,
+    on_provider_event: callable | None = None,
 ) -> Iterator[LLMStreamEvent]:
     text_parts: list[str] = []
     block_types: dict[int, str] = {}
@@ -923,6 +1036,11 @@ def _anthropic_stream_to_events(
 
     try:
         for event in stream:
+            if on_provider_event is not None:
+                try:
+                    on_provider_event(event)
+                except Exception:
+                    pass
             if on_event is not None:
                 try:
                     on_event()

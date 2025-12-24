@@ -27,6 +27,8 @@ class UIEventKind(str, Enum):
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_CALL_COMPLETED = "tool_call_completed"
 
+    PLAN_UPDATED = "plan_updated"
+
     PROGRESS = "progress"
     WARNING = "warning"
     LOG = "log"
@@ -242,6 +244,51 @@ class ConsoleUI:
                 self._println_dim(f"[tool] {tool} done")
             else:
                 self._println_red(f"[tool] {tool} failed")
+            return
+
+        if k is UIEventKind.PLAN_UPDATED:
+            self._stop_waiting(clear_line=True)
+            self._ensure_newline_if_streaming()
+
+            explanation = str(p.get("explanation") or "").strip()
+            raw_plan = p.get("plan")
+
+            self._println_dim("[plan] Updated plan")
+            if explanation:
+                one_line = " ".join(explanation.splitlines()).strip()
+                if one_line:
+                    self._println_dim(f"  (why: {self._elide_tail(one_line, 80)})")
+
+            if not isinstance(raw_plan, list) or not raw_plan:
+                self._println_dim("  (empty)")
+                return
+
+            max_lines = 12
+            shown = 0
+            for item in raw_plan:
+                if shown >= max_lines:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                step = str(item.get("step") or "").strip()
+                status = str(item.get("status") or "").strip()
+                if not step or not status:
+                    continue
+
+                if status == "completed":
+                    prefix = "[x]"
+                    self._println_dim(f"  {prefix} {step}")
+                elif status == "in_progress":
+                    prefix = "[~]"
+                    self._println(self._color(f"  {prefix} {step}", "1;36"))
+                else:
+                    prefix = "[ ]"
+                    self._println_dim(f"  {prefix} {step}")
+                shown += 1
+
+            remaining = len([x for x in raw_plan if isinstance(x, dict)]) - shown
+            if remaining > 0:
+                self._println_dim(f"  ... ({remaining} more)")
             return
 
         if k is UIEventKind.PROGRESS:

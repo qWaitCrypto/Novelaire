@@ -14,6 +14,7 @@ dependencies = [
   "openai>=2.14.0",
   "prompt_toolkit>=3.0.0",
   "rich>=13.7.0",
+  "strictyaml>=1.7.3",
 ]
 
 [project.scripts]
@@ -21,3 +22,6 @@ novelaire = "novelaire.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["novelaire*"]
+
+[tool.setuptools.package-data]
+novelaire = ["builtin/skills/**/*"]

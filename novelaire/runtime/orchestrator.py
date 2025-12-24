@@ -8,6 +8,7 @@ from typing import Any, Iterable, Iterator
 
 from .approval import ApprovalDecision, ApprovalRecord, ApprovalStatus
 from .error_codes import ErrorCode
+from .agent_surface import SpecStatusSummary, build_agent_surface
 from .event_bus import EventBus
 from .ids import new_id, now_ts_ms
 from .protocol import Event, EventKind, Op, OpKind
@@ -17,6 +18,11 @@ from .llm.client import LLMClient
 from .llm.config import ModelConfig
 from .llm.errors import CancellationToken, LLMRequestError, ModelResolutionError
 from .llm.router import ModelRouter
+from .llm.trace import LLMTrace
+from .skills import SkillStore
+from .plan import PlanStore
+from .snapshots import GitSnapshotBackend
+from .spec_workflow import SpecProposalStore, SpecStateStore, SpecStore
 from .llm.types import (
     CanonicalMessage,
     CanonicalMessageRole,
@@ -25,6 +31,7 @@ from .llm.types import (
     ModelRole,
     ProviderKind,
     ToolCall,
+    ToolSpec,
 )
 from .tools import (
     InspectionDecision,
@@ -34,6 +41,15 @@ from .tools import (
     ProjectWriteTextTool,
     PlannedToolCall,
     ShellRunTool,
+    SkillListTool,
+    SkillLoadTool,
+    SkillReadFileTool,
+    UpdatePlanTool,
+    SpecQueryTool,
+    SpecGetTool,
+    SpecProposeTool,
+    SpecApplyTool,
+    SpecSealTool,
     ToolExecutionResult,
     ToolRegistry,
     ToolRuntime,
@@ -61,6 +77,12 @@ class Orchestrator:
     approval_store: ApprovalStore
     llm_client: LLMClient
     model_router: ModelRouter
+    skill_store: SkillStore | None = None
+    plan_store: PlanStore | None = None
+    spec_store: SpecStore | None = None
+    spec_state_store: SpecStateStore | None = None
+    spec_proposal_store: SpecProposalStore | None = None
+    snapshot_backend: GitSnapshotBackend | None = None
     tools_enabled: bool = False
     tool_registry: ToolRegistry | None = None
     tool_runtime: ToolRuntime | None = None
@@ -84,12 +106,27 @@ class Orchestrator:
     ) -> "Orchestrator":
         effective_system_prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
         router = ModelRouter(model_config)
+        skill_store = SkillStore(project_root=project_root)
+        plan_store = PlanStore(session_store=session_store, session_id=session_id)
+        spec_store = SpecStore(project_root=project_root)
+        spec_state_store = SpecStateStore(project_root=project_root)
+        spec_proposal_store = SpecProposalStore(project_root=project_root)
+        snapshot_backend = GitSnapshotBackend(project_root=project_root)
         registry = ToolRegistry()
         registry.register(ProjectReadTextTool())
         registry.register(ProjectWriteTextTool())
         registry.register(ProjectTextEditorTool())
         registry.register(ProjectSearchTextTool())
         registry.register(ShellRunTool())
+        registry.register(SkillListTool(skill_store))
+        registry.register(SkillLoadTool(skill_store))
+        registry.register(SkillReadFileTool(skill_store))
+        registry.register(UpdatePlanTool(plan_store))
+        registry.register(SpecQueryTool(spec_store))
+        registry.register(SpecGetTool(spec_store))
+        registry.register(SpecProposeTool(spec_store, spec_proposal_store, spec_state_store, artifact_store))
+        registry.register(SpecApplyTool(spec_proposal_store, spec_state_store))
+        registry.register(SpecSealTool(spec_state_store, snapshot_backend))
         tool_runtime = ToolRuntime(project_root=project_root, registry=registry, artifact_store=artifact_store)
         return Orchestrator(
             project_root=project_root,
@@ -101,6 +138,12 @@ class Orchestrator:
             approval_store=approval_store,
             llm_client=LLMClient(model_config),
             model_router=router,
+            skill_store=skill_store,
+            plan_store=plan_store,
+            spec_store=spec_store,
+            spec_state_store=spec_state_store,
+            spec_proposal_store=spec_proposal_store,
+            snapshot_backend=snapshot_backend,
             tools_enabled=tools_enabled,
             tool_registry=registry,
             tool_runtime=tool_runtime,
@@ -443,10 +486,28 @@ class Orchestrator:
         )
 
     def _build_request(self) -> CanonicalRequest:
-        tools = []
+        tools: list[ToolSpec] = []
         if self.tools_enabled and self.tool_registry is not None:
             tools = self.tool_registry.list_specs()
-        return CanonicalRequest(system=self.system_prompt, messages=list(self._history or []), tools=tools)
+
+        skills = self.skill_store.list() if self.skill_store is not None else []
+        plan = self.plan_store.get().plan if self.plan_store is not None else []
+
+        spec_summary = SpecStatusSummary(status="open")
+        if self.spec_state_store is not None:
+            state = self.spec_state_store.get()
+            spec_summary = SpecStatusSummary(status=state.status, label=state.label)
+
+        surface = build_agent_surface(
+            tools=tools,
+            skills=skills,
+            plan=plan,
+            spec=spec_summary,
+        )
+
+        base_system = self.system_prompt or DEFAULT_SYSTEM_PROMPT
+        system = f"{base_system}\n\n{surface}"
+        return CanonicalRequest(system=system, messages=list(self._history or []), tools=tools)
 
     def _write_context_ref(self, request: CanonicalRequest) -> "ArtifactRef":
         payload = _canonical_request_to_redacted_dict(request)
@@ -469,6 +530,15 @@ class Orchestrator:
         cancel: CancellationToken | None,
     ) -> tuple[Any | None, list[PlannedToolCall]]:
         cancel = cancel or CancellationToken()
+        trace = LLMTrace.maybe_create(
+            project_root=self.project_root,
+            session_id=self.session_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+        if trace is not None:
+            trace.record_meta(profile_id=profile_id, context_ref=context_ref, operation="stream")
         stream_iter = None
         self._emit(
             kind=EventKind.LLM_REQUEST_STARTED,
@@ -495,6 +565,7 @@ class Orchestrator:
                 request=request,
                 timeout_s=timeout_s,
                 cancel=cancel,
+                trace=trace,
             )
             for ev in stream_iter:
                 if ev.kind.value == "text_delta" and ev.text_delta is not None:
@@ -527,8 +598,10 @@ class Orchestrator:
                     )
                 elif ev.kind.value == "completed" and ev.response is not None:
                     final_response = ev.response
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             cancel.cancel()
+            if trace is not None:
+                trace.record_cancelled(reason="user_interrupt", code=ErrorCode.CANCELLED.value)
             if stream_iter is not None:
                 try:
                     close = getattr(stream_iter, "close", None)
@@ -558,6 +631,11 @@ class Orchestrator:
             )
             return None, []
         except LLMRequestError as e:
+            if trace is not None:
+                if e.code is ErrorCode.CANCELLED:
+                    trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
+                else:
+                    trace.record_error(e, code=e.code.value if e.code is not None else None)
             if e.code is ErrorCode.CANCELLED:
                 self._emit(
                     kind=EventKind.LLM_REQUEST_FAILED,
@@ -569,6 +647,7 @@ class Orchestrator:
                         "profile_id": e.profile_id,
                         "model": e.model,
                         "retryable": e.retryable,
+                        "details": e.details,
                     },
                     request_id=request_id,
                     turn_id=turn_id,
@@ -597,6 +676,7 @@ class Orchestrator:
                     "profile_id": e.profile_id,
                     "model": e.model,
                     "retryable": e.retryable,
+                    "details": e.details,
                 },
                 request_id=request_id,
                 turn_id=turn_id,
@@ -611,6 +691,8 @@ class Orchestrator:
             )
             return None, []
         except ModelResolutionError as e:
+            if trace is not None:
+                trace.record_error(e, code=ErrorCode.MODEL_RESOLUTION.value)
             self._emit(
                 kind=EventKind.MODEL_RESOLUTION_FAILED,
                 payload={
@@ -648,6 +730,8 @@ class Orchestrator:
             streamed_parts.append(emitted)
 
         if final_response is None:
+            if trace is not None:
+                trace.record_error(RuntimeError("LLM stream ended without a completed response."), code=ErrorCode.RESPONSE_VALIDATION.value)
             self._emit(
                 kind=EventKind.OPERATION_FAILED,
                 payload={
@@ -713,6 +797,8 @@ class Orchestrator:
             step_id=step_id,
         )
 
+        if trace is not None:
+            trace.record_response(final_response)
         return final_response, planned_calls
 
     def _run_llm_complete(
@@ -728,6 +814,15 @@ class Orchestrator:
         cancel: CancellationToken | None,
     ) -> tuple[Any | None, list[PlannedToolCall]]:
         cancel = cancel or CancellationToken()
+        trace = LLMTrace.maybe_create(
+            project_root=self.project_root,
+            session_id=self.session_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+        if trace is not None:
+            trace.record_meta(profile_id=profile_id, context_ref=context_ref, operation="complete")
         self._emit(
             kind=EventKind.LLM_REQUEST_STARTED,
             payload={
@@ -749,8 +844,14 @@ class Orchestrator:
                 request=request,
                 timeout_s=timeout_s,
                 cancel=cancel,
+                trace=trace,
             )
         except LLMRequestError as e:
+            if trace is not None:
+                if e.code is ErrorCode.CANCELLED:
+                    trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
+                else:
+                    trace.record_error(e, code=e.code.value if e.code is not None else None)
             self._emit(
                 kind=EventKind.LLM_REQUEST_FAILED,
                 payload={
@@ -761,6 +862,7 @@ class Orchestrator:
                     "profile_id": e.profile_id,
                     "model": e.model,
                     "retryable": e.retryable,
+                    "details": e.details,
                 },
                 request_id=request_id,
                 turn_id=turn_id,
@@ -850,6 +952,8 @@ class Orchestrator:
             step_id=step_id,
         )
 
+        if trace is not None:
+            trace.record_response(final_response)
         return final_response, planned_calls
 
     def _handle_planned_tool_calls(
@@ -1005,6 +1109,20 @@ class Orchestrator:
                 turn_id=turn_id,
                 step_id=planned.tool_execution_id,
             )
+
+            if result.status == "succeeded" and result.tool_name == "update_plan" and self.plan_store is not None:
+                state = self.plan_store.get()
+                self._emit(
+                    kind=EventKind.PLAN_UPDATE,
+                    payload={
+                        "explanation": state.explanation,
+                        "plan": [p.to_dict() for p in state.plan],
+                        "updated_at": state.updated_at,
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=planned.tool_execution_id,
+                )
 
             if result.status != "succeeded" or result.tool_message_content is None:
                 op_code = result.error_code or ErrorCode.TOOL_FAILED

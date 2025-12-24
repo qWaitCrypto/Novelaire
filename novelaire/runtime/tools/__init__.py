@@ -17,6 +17,9 @@ from .runtime import (
     ToolRuntime,
     ToolRuntimeError,
 )
+from .skills import SkillListTool, SkillLoadTool, SkillReadFileTool
+from .plan import UpdatePlanTool
+from .spec_workflow import SpecApplyTool, SpecGetTool, SpecProposeTool, SpecQueryTool, SpecSealTool
 
 __all__ = [
     "ToolRegistry",
@@ -32,4 +35,13 @@ __all__ = [
     "ProjectTextEditorTool",
     "ProjectWriteTextTool",
     "ShellRunTool",
+    "SkillListTool",
+    "SkillLoadTool",
+    "SkillReadFileTool",
+    "UpdatePlanTool",
+    "SpecQueryTool",
+    "SpecGetTool",
+    "SpecProposeTool",
+    "SpecApplyTool",
+    "SpecSealTool",
 ]
