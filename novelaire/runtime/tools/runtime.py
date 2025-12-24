@@ -18,6 +18,24 @@ class ToolRuntimeError(RuntimeError):
     pass
 
 
+def _elide_tail(s: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(s) <= max_chars:
+        return s
+    return s[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _summarize_shell_run_args(args: dict[str, Any], *, max_chars: int = 120) -> str:
+    command = args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return "Run shell command"
+    one_line = " ".join(command.splitlines()).strip()
+    one_line = " ".join(one_line.split())
+    one_line = _elide_tail(one_line, max_chars)
+    return f"Run $ {one_line}"
+
+
 class InspectionDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -133,9 +151,10 @@ class ToolRuntime:
             return self._inspect_spec_workflow(planned)
 
         if planned.tool_name == "shell__run" and _shell_run_is_allowlisted(self._project_root, planned.arguments):
+            summary = _summarize_shell_run_args(planned.arguments)
             return InspectionResult(
                 decision=InspectionDecision.ALLOW,
-                action_summary="Run shell command (allowlisted)",
+                action_summary=f"{summary} (allowlisted)",
                 risk_level="high",
                 reason="Matched local allowlist.",
                 error_code=None,
@@ -156,6 +175,7 @@ class ToolRuntime:
             return self._inspect_strict(planned)
 
         if planned.tool_name == "shell__run":
+            summary = _summarize_shell_run_args(planned.arguments)
             try:
                 diff_ref = self._build_shell_run_preview(planned)
             except Exception as e:
@@ -170,7 +190,7 @@ class ToolRuntime:
                 )
             return InspectionResult(
                 decision=InspectionDecision.REQUIRE_APPROVAL,
-                action_summary="Run shell command",
+                action_summary=summary,
                 risk_level="high",
                 reason="Shell commands can modify files and system state.",
                 error_code=None,
@@ -563,6 +583,7 @@ class ToolRuntime:
             )
 
         if tool_name == "shell__run":
+            summary = _summarize_shell_run_args(planned.arguments)
             try:
                 diff_ref = self._build_shell_run_preview(planned)
             except Exception as e:
@@ -577,7 +598,7 @@ class ToolRuntime:
                 )
             return InspectionResult(
                 decision=InspectionDecision.REQUIRE_APPROVAL,
-                action_summary="Run shell command",
+                action_summary=summary,
                 risk_level="high",
                 reason="Strict mode: approve every tool call.",
                 error_code=None,

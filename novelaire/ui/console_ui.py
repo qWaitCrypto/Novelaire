@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Sequence
@@ -82,6 +83,47 @@ class ConsoleUI:
         self._pending_tool_items: list[tuple[str, str]] = []
         self._pending_tool_omitted = 0
 
+        # Interop with full-screen terminal UIs (e.g. prompt_toolkit dialogs).
+        self._io_lock = threading.RLock()
+        self._suspend_lock = threading.Lock()
+        self._suspend_count = 0
+        self._deferred_events: list[UIEvent] = []
+
+    @contextmanager
+    def suspend(self) -> Iterable[None]:
+        """
+        Temporarily stop rendering to stdout while a full-screen terminal UI runs.
+
+        The renderer thread continues consuming events but buffers them until resumed.
+        """
+
+        first = False
+        with self._suspend_lock:
+            self._suspend_count += 1
+            first = self._suspend_count == 1
+
+        if first:
+            with self._io_lock:
+                self._stop_waiting(clear_line=True)
+                self._ensure_newline_if_streaming()
+
+        try:
+            yield
+        finally:
+            deferred: list[UIEvent] = []
+            last = False
+            with self._suspend_lock:
+                if self._suspend_count > 0:
+                    self._suspend_count -= 1
+                last = self._suspend_count == 0
+                if last and self._deferred_events:
+                    deferred = self._deferred_events
+                    self._deferred_events = []
+
+            if last and deferred:
+                for ev in deferred:
+                    self.emit(ev)
+
     def _tool_category(self, tool_name: str) -> str:
         if tool_name in {"project__read_text", "project__search_text"} or tool_name.startswith("skill__"):
             return "Explored"
@@ -127,6 +169,20 @@ class ConsoleUI:
         self._pending_tool_items.clear()
         self._pending_tool_omitted = 0
 
+    def _println_multiline(self, msg: str, *, dim: bool, prefix: str | None = None) -> None:
+        if msg == "":
+            self._println()
+            return
+        lines = msg.splitlines()
+        if msg.endswith("\n"):
+            lines.append("")
+        for line in lines:
+            out = line if prefix is None else prefix + line
+            if dim:
+                self._println_dim(out)
+            else:
+                self._println(out)
+
     # --- lifecycle ---
     def start(self) -> None:
         if self._thread is not None:
@@ -163,9 +219,18 @@ class ConsoleUI:
         while not self._stop.is_set():
             try:
                 ev = self._q.get(timeout=tick_interval_s)
+                with self._suspend_lock:
+                    suspended = self._suspend_count > 0
+                if suspended and ev.kind is not UIEventKind.EXIT_REQUESTED:
+                    with self._suspend_lock:
+                        self._deferred_events.append(ev)
+                    continue
                 self._handle_event(ev)
             except queue.Empty:
-                self._tick()
+                with self._suspend_lock:
+                    suspended = self._suspend_count > 0
+                if not suspended:
+                    self._tick()
             except Exception:
                 # UI must not crash the process.
                 pass
@@ -385,7 +450,10 @@ class ConsoleUI:
             level = str(p.get("level", "info"))
             msg = str(p.get("message", "") or "")
             if msg:
-                self._println_dim(f"[{level}] {msg}")
+                if level == "approval":
+                    self._println_multiline(msg, dim=False)
+                else:
+                    self._println_multiline(f"[{level}] {msg}", dim=True)
             return
 
         if k is UIEventKind.ERROR_RAISED:
@@ -421,11 +489,12 @@ class ConsoleUI:
         return f"\x1b[{code}m{s}\x1b[0m"
 
     def _write(self, s: str) -> None:
-        self._stream.write(s)
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
+        with self._io_lock:
+            self._stream.write(s)
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
 
     def _println(self, s: str = "") -> None:
         self._write(s + "\n")
