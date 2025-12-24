@@ -203,7 +203,8 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             caps = profile.capabilities.with_provider_defaults(profile.provider_kind)
             enable_tools = caps.supports_tools is True
 
-    default_approval_mode = ToolApprovalMode.STRICT
+    # Default: require approval only for high-risk operations (shell commands).
+    default_approval_mode = ToolApprovalMode.STANDARD
     session_id = args.session_id
     if session_id is None:
         session_id = session_store.create_session(
@@ -431,31 +432,105 @@ def _run_chat_console_ui(
             if not pending:
                 return
             record = pending[0]
-            ui.emit(
-                UIEvent(
-                    UIEventKind.WARNING,
-                    {"message": f"Approval required: {record.approval_id}\n{record.action_summary}"},
+            tool_name = None
+            tool_args: dict | None = None
+            try:
+                raw_calls = record.resume_payload.get("tool_calls") if isinstance(record.resume_payload, dict) else None
+                if isinstance(raw_calls, list) and raw_calls and isinstance(raw_calls[0], dict):
+                    first = raw_calls[0]
+                    tool_name = first.get("tool_name")
+                    args_ref = first.get("arguments_ref")
+                    if isinstance(args_ref, dict):
+                        ref = ArtifactRef.from_dict(args_ref)
+                        raw = orchestrator.artifact_store.get(ref)
+                        tool_args_any = json.loads(raw.decode("utf-8", errors="replace"))
+                        if isinstance(tool_args_any, dict):
+                            tool_args = tool_args_any
+            except Exception:
+                tool_name = tool_name
+
+            # Compact approval prompt (Codex/Goose-ish).
+            if tool_name == "shell__run" and isinstance(tool_args, dict):
+                cmd = tool_args.get("command")
+                cwd = tool_args.get("cwd") or "."
+                preview = f"$ {cmd}\n(cwd: {cwd})"
+                ui.emit(
+                    UIEvent(
+                        UIEventKind.LOG,
+                        {"level": "approval", "message": "Would you like to run the following command?\n"},
+                    )
                 )
-            )
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "  " + preview.replace("\n", "\n  ")}))
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": ""}))
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "› 1. Yes, proceed (y)"}))
+                ui.emit(
+                    UIEvent(
+                        UIEventKind.LOG,
+                        {
+                            "level": "approval",
+                            "message": "  2. Yes, and don't ask again for commands that start with this command (p)",
+                        },
+                    )
+                )
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "  3. No (n)"}))
+                ui.emit(
+                    UIEvent(
+                        UIEventKind.LOG,
+                        {"level": "approval", "message": "  4. No, and tell the assistant what to do differently (r)"},
+                    )
+                )
+            else:
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "Approval required:"}))
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": f"  {record.action_summary}"}))
             while True:
                 try:
-                    ans = _prompt("Decision [a=approve/d=deny] > ").strip().lower()
+                    ans = _prompt("Decision [y/p/n/r] > ").strip().lower()
                 except KeyboardInterrupt:
                     ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Approval decision cancelled; still pending."}))
                     break
-                decision = (
-                    "approve"
-                    if ans in {"a", "approve", "yes", "y"}
-                    else "deny"
-                    if ans in {"d", "deny", "no", "n"}
-                    else ""
-                )
-                if not decision:
-                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Please type 'a' or 'd'."}))
+                if ans in {"1", "y", "yes", "a", "approve"}:
+                    decision = "approve"
+                    note = None
+                    persist = False
+                elif ans in {"2", "p", "persist"}:
+                    decision = "approve"
+                    note = None
+                    persist = True
+                elif ans in {"3", "n", "no", "d", "deny"}:
+                    decision = "deny"
+                    note = None
+                    persist = False
+                elif ans in {"4", "r", "revise"}:
+                    decision = "deny"
+                    persist = False
+                    try:
+                        note = _prompt("Tell assistant what to do differently> ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        note = None
+                else:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Please type y/p/n/r (or 1/2/3/4)."}))
                     continue
+
+                if persist and tool_name == "shell__run" and isinstance(tool_args, dict):
+                    try:
+                        from .runtime.tools.runtime import add_shell_run_allowlist_rule
+
+                        cmd = tool_args.get("command")
+                        cwd = tool_args.get("cwd") if isinstance(tool_args.get("cwd"), str) else None
+                        if isinstance(cmd, str) and cmd.strip():
+                            add_shell_run_allowlist_rule(
+                                project_root=orchestrator.project_root,
+                                command_prefix=" ".join(cmd.strip().splitlines()).strip(),
+                                cwd=cwd,
+                            )
+                            ui.emit(
+                                UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Saved allowlist rule for this command."})
+                            )
+                    except Exception:
+                        pass
                 op = Op(
                     kind=OpKind.APPROVAL_DECISION.value,
-                    payload={"approval_id": record.approval_id, "decision": decision},
+                    payload={"approval_id": record.approval_id, "decision": decision, "note": note},
                     session_id=session_id,
                     request_id=new_id("req"),
                     timestamp=now_ts_ms(),
@@ -468,6 +543,23 @@ def _run_chat_console_ui(
                 )
                 t.start()
                 _wait_with_ctrl_c(t, cancel)
+
+                if decision == "deny" and isinstance(note, str) and note.strip():
+                    follow = Op(
+                        kind=OpKind.CHAT.value,
+                        payload={"text": note.strip()},
+                        session_id=session_id,
+                        request_id=new_id("req"),
+                        timestamp=now_ts_ms(),
+                        turn_id=new_id("turn"),
+                    )
+                    cancel2 = CancellationToken()
+                    t2 = threading.Thread(
+                        target=lambda: orchestrator.handle(follow, timeout_s=timeout_s, cancel=cancel2),
+                        daemon=True,
+                    )
+                    t2.start()
+                    _wait_with_ctrl_c(t2, cancel2)
                 break
 
     # Initial approvals (resume case).
@@ -951,12 +1043,7 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         return out
 
     if kind == EventKind.APPROVAL_REQUIRED.value:
-        approval_id = payload.get("approval_id") or ""
-        summary = payload.get("action_summary") or ""
-        tool_summary = payload.get("summary")
-        if isinstance(tool_summary, str) and tool_summary.strip():
-            summary = f"{summary} ({tool_summary.strip()})"
-        out.append(UIEvent(UIEventKind.WARNING, {"message": f"[approval] {approval_id}: {summary}".strip()}))
+        # Interactive approval prompts are handled by the pending-approvals loop to avoid duplicate/noisy output.
         return out
 
     if kind == EventKind.OPERATION_CANCELLED.value:

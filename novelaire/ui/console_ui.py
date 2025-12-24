@@ -295,14 +295,20 @@ class ConsoleUI:
             suffix_parts: list[str] = []
             if isinstance(duration_ms, int) and duration_ms >= 500:
                 suffix_parts.append(f"{duration_ms}ms")
-            if status and status not in {"succeeded", "ok"}:
-                suffix_parts.append(status)
-            if error_code:
-                suffix_parts.append(str(error_code))
-            if error:
-                one_line = " ".join(str(error).splitlines()).strip()
-                if one_line:
-                    suffix_parts.append(one_line)
+            # Special-case approval denial to avoid noisy duplicates like "(cancelled; cancelled; Approval denied.)".
+            if str(error_code) == "cancelled" and str(error).strip() == "Approval denied.":
+                suffix_parts.append("approval denied")
+            else:
+                if status and status not in {"succeeded", "ok"}:
+                    suffix_parts.append(status)
+                if error_code and str(error_code) not in {"", "none"}:
+                    # Avoid repeating "cancelled" twice (status + code).
+                    if not (status == "cancelled" and str(error_code) == "cancelled"):
+                        suffix_parts.append(str(error_code))
+                if error:
+                    one_line = " ".join(str(error).splitlines()).strip()
+                    if one_line:
+                        suffix_parts.append(one_line)
 
             suffix = ""
             if suffix_parts:

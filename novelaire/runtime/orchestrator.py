@@ -1290,6 +1290,12 @@ class Orchestrator:
                     tool_execution_id = first.get("tool_execution_id")
                     tool_name = first.get("tool_name")
                     tool_call_id = first.get("tool_call_id")
+                    summary = None
+                    try:
+                        planned = _planned_tool_call_from_descriptor(first, read_artifact_text=self._read_artifact_text)
+                        summary = _summarize_tool_for_ui(planned.tool_name, planned.arguments)
+                    except Exception:
+                        summary = None
                     if (
                         isinstance(tool_execution_id, str)
                         and tool_execution_id
@@ -1304,6 +1310,7 @@ class Orchestrator:
                                 "tool_execution_id": tool_execution_id,
                                 "tool_name": tool_name,
                                 "tool_call_id": tool_call_id,
+                                "summary": summary,
                                 "status": "cancelled",
                                 "error_code": ErrorCode.CANCELLED.value,
                                 "error": "Approval denied.",
