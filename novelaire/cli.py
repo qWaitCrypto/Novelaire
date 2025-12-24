@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -427,6 +428,22 @@ def _run_chat_console_ui(
         return input(text)
 
     def _handle_pending_approvals_ui(*, request_id: str | None) -> None:
+        def _prompt_decision(text: str) -> str:
+            if prompt_session is not None:
+                try:
+                    return prompt_session.prompt(text, multiline=False)
+                except TypeError:
+                    return prompt_session.prompt(text)
+            return input(text)
+
+        def _one_line_preview(value: object, *, max_chars: int) -> str:
+            if not isinstance(value, str):
+                return ""
+            s = " ".join(value.splitlines()).strip()
+            if len(s) <= max_chars:
+                return s
+            return s[: max(0, max_chars - 1)].rstrip() + "…"
+
         while True:
             pending = approval_store.list(session_id=session_id, status=ApprovalStatus.PENDING, request_id=request_id)
             if not pending:
@@ -450,117 +467,106 @@ def _run_chat_console_ui(
                 tool_name = tool_name
 
             # Compact approval prompt (Codex/Goose-ish).
-            if tool_name == "shell__run" and isinstance(tool_args, dict):
-                cmd = tool_args.get("command")
-                cwd = tool_args.get("cwd") or "."
-                preview = f"$ {cmd}\n(cwd: {cwd})"
-                ui.emit(
-                    UIEvent(
-                        UIEventKind.LOG,
-                        {"level": "approval", "message": "Would you like to run the following command?\n"},
-                    )
-                )
-                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "  " + preview.replace("\n", "\n  ")}))
-                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": ""}))
-                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "› 1. Yes, proceed (y)"}))
-                ui.emit(
-                    UIEvent(
-                        UIEventKind.LOG,
-                        {
-                            "level": "approval",
-                            "message": "  2. Yes, and don't ask again for commands that start with this command (p)",
-                        },
-                    )
-                )
-                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "  3. No (n)"}))
-                ui.emit(
-                    UIEvent(
-                        UIEventKind.LOG,
-                        {"level": "approval", "message": "  4. No, and tell the assistant what to do differently (r)"},
-                    )
-                )
+            is_shell_run = tool_name == "shell__run" and isinstance(tool_args, dict)
+            if is_shell_run:
+                cmd = _one_line_preview(tool_args.get("command"), max_chars=240)
+                cwd = _one_line_preview(tool_args.get("cwd") or ".", max_chars=120) or "."
+                preview = f"$ {cmd}" if cmd else "$ <missing command>"
+
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "Would you like to run the following command?"}))
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": f"  {preview}"}))
+                if cwd and cwd != ".":
+                    ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": f"  (cwd: {cwd})"}))
+
+                while True:
+                    try:
+                        ans = _prompt_decision("Proceed? [y/n] > ").strip().lower()
+                    except KeyboardInterrupt:
+                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Approval cancelled; still pending."}))
+                        return
+                    if ans in {"y", "yes"}:
+                        decision, note = "approve", None
+                        # Keep approvals explicit for now; per-command remember/allowlist can be re-enabled later.
+                        persist = False
+                        break
+                    if ans in {"n", "no"}:
+                        decision, persist = "deny", False
+                        try:
+                            note_raw = _prompt_decision("Tell assistant what to do differently (optional)> ").strip()
+                        except (EOFError, KeyboardInterrupt):
+                            note_raw = ""
+                        note = note_raw if note_raw else None
+                        break
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Please type y or n."}))
             else:
                 ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": "Approval required:"}))
                 ui.emit(UIEvent(UIEventKind.LOG, {"level": "approval", "message": f"  {record.action_summary}"}))
-            while True:
+                while True:
+                    try:
+                        ans = _prompt_decision("Proceed? [y/n] > ").strip().lower()
+                    except KeyboardInterrupt:
+                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Approval cancelled; still pending."}))
+                        return
+                    if ans in {"y", "yes"}:
+                        decision, persist, note = "approve", False, None
+                        break
+                    if ans in {"n", "no"}:
+                        decision, persist = "deny", False
+                        try:
+                            note_raw = _prompt_decision("Tell assistant what to do differently (optional)> ").strip()
+                        except (EOFError, KeyboardInterrupt):
+                            note_raw = ""
+                        note = note_raw if note_raw else None
+                        break
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Please type y or n."}))
+            if persist and tool_name == "shell__run" and isinstance(tool_args, dict):
                 try:
-                    ans = _prompt("Decision [y/p/n/r] > ").strip().lower()
-                except KeyboardInterrupt:
-                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Approval decision cancelled; still pending."}))
-                    break
-                if ans in {"1", "y", "yes", "a", "approve"}:
-                    decision = "approve"
-                    note = None
-                    persist = False
-                elif ans in {"2", "p", "persist"}:
-                    decision = "approve"
-                    note = None
-                    persist = True
-                elif ans in {"3", "n", "no", "d", "deny"}:
-                    decision = "deny"
-                    note = None
-                    persist = False
-                elif ans in {"4", "r", "revise"}:
-                    decision = "deny"
-                    persist = False
-                    try:
-                        note = _prompt("Tell assistant what to do differently> ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        note = None
-                else:
-                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Please type y/p/n/r (or 1/2/3/4)."}))
-                    continue
+                    from .runtime.tools.runtime import add_shell_run_allowlist_rule
 
-                if persist and tool_name == "shell__run" and isinstance(tool_args, dict):
-                    try:
-                        from .runtime.tools.runtime import add_shell_run_allowlist_rule
+                    cmd = tool_args.get("command")
+                    cwd = tool_args.get("cwd") if isinstance(tool_args.get("cwd"), str) else None
+                    if isinstance(cmd, str) and cmd.strip():
+                        add_shell_run_allowlist_rule(
+                            project_root=orchestrator.project_root,
+                            command_prefix=" ".join(cmd.strip().splitlines()).strip(),
+                            cwd=cwd,
+                        )
+                        ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Saved allowlist rule for this command."}))
+                except Exception:
+                    pass
 
-                        cmd = tool_args.get("command")
-                        cwd = tool_args.get("cwd") if isinstance(tool_args.get("cwd"), str) else None
-                        if isinstance(cmd, str) and cmd.strip():
-                            add_shell_run_allowlist_rule(
-                                project_root=orchestrator.project_root,
-                                command_prefix=" ".join(cmd.strip().splitlines()).strip(),
-                                cwd=cwd,
-                            )
-                            ui.emit(
-                                UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Saved allowlist rule for this command."})
-                            )
-                    except Exception:
-                        pass
-                op = Op(
-                    kind=OpKind.APPROVAL_DECISION.value,
-                    payload={"approval_id": record.approval_id, "decision": decision, "note": note},
+            op = Op(
+                kind=OpKind.APPROVAL_DECISION.value,
+                payload={"approval_id": record.approval_id, "decision": decision, "note": note},
+                session_id=session_id,
+                request_id=new_id("req"),
+                timestamp=now_ts_ms(),
+                turn_id=new_id("turn"),
+            )
+            cancel = CancellationToken()
+            t = threading.Thread(
+                target=lambda: orchestrator.handle(op, timeout_s=timeout_s, cancel=cancel),
+                daemon=True,
+            )
+            t.start()
+            _wait_with_ctrl_c(t, cancel)
+
+            if decision == "deny" and isinstance(note, str) and note.strip():
+                follow = Op(
+                    kind=OpKind.CHAT.value,
+                    payload={"text": note.strip()},
                     session_id=session_id,
                     request_id=new_id("req"),
                     timestamp=now_ts_ms(),
                     turn_id=new_id("turn"),
                 )
-                cancel = CancellationToken()
-                t = threading.Thread(
-                    target=lambda: orchestrator.handle(op, timeout_s=timeout_s, cancel=cancel),
+                cancel2 = CancellationToken()
+                t2 = threading.Thread(
+                    target=lambda: orchestrator.handle(follow, timeout_s=timeout_s, cancel=cancel2),
                     daemon=True,
                 )
-                t.start()
-                _wait_with_ctrl_c(t, cancel)
-
-                if decision == "deny" and isinstance(note, str) and note.strip():
-                    follow = Op(
-                        kind=OpKind.CHAT.value,
-                        payload={"text": note.strip()},
-                        session_id=session_id,
-                        request_id=new_id("req"),
-                        timestamp=now_ts_ms(),
-                        turn_id=new_id("turn"),
-                    )
-                    cancel2 = CancellationToken()
-                    t2 = threading.Thread(
-                        target=lambda: orchestrator.handle(follow, timeout_s=timeout_s, cancel=cancel2),
-                        daemon=True,
-                    )
-                    t2.start()
-                    _wait_with_ctrl_c(t2, cancel2)
-                break
+                t2.start()
+                _wait_with_ctrl_c(t2, cancel2)
 
     # Initial approvals (resume case).
     try:
