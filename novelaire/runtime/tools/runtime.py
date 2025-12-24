@@ -132,6 +132,16 @@ class ToolRuntime:
         if planned.tool_name in {"spec__apply", "spec__seal"}:
             return self._inspect_spec_workflow(planned)
 
+        if planned.tool_name == "shell__run" and _shell_run_is_allowlisted(self._project_root, planned.arguments):
+            return InspectionResult(
+                decision=InspectionDecision.ALLOW,
+                action_summary="Run shell command (allowlisted)",
+                risk_level="high",
+                reason="Matched local allowlist.",
+                error_code=None,
+                diff_ref=None,
+            )
+
         if self._approval_mode is ToolApprovalMode.TRUSTED:
             return InspectionResult(
                 decision=InspectionDecision.ALLOW,
@@ -612,6 +622,85 @@ def _classify_tool_exception(exc: BaseException) -> ErrorCode:
 def _is_under_spec_dir(path: str) -> bool:
     normalized = path.replace("\\", "/").lstrip("/")
     return normalized == "spec" or normalized.startswith("spec/")
+
+
+def _tool_approval_policy_path(project_root: Path) -> Path:
+    # Keep this in the author-visible policy dir so users can audit/edit it.
+    return project_root / ".novelaire" / "policy" / "tool_approvals.json"
+
+
+def _load_tool_approval_policy(project_root: Path) -> dict[str, Any]:
+    path = _tool_approval_policy_path(project_root)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_tool_approval_policy(project_root: Path, policy: dict[str, Any]) -> None:
+    path = _tool_approval_policy_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(policy, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def add_shell_run_allowlist_rule(*, project_root: Path, command_prefix: str, cwd: str | None) -> None:
+    command_prefix = " ".join(str(command_prefix).splitlines()).strip()
+    if not command_prefix:
+        return
+    policy = _load_tool_approval_policy(project_root)
+    rules = policy.get("shell__run_allow", [])
+    if not isinstance(rules, list):
+        rules = []
+    entry: dict[str, Any] = {"command_prefix": command_prefix}
+    if cwd is not None and str(cwd).strip():
+        entry["cwd"] = str(cwd).strip()
+    for existing in rules:
+        if not isinstance(existing, dict):
+            continue
+        if existing.get("command_prefix") == entry.get("command_prefix") and existing.get("cwd") == entry.get("cwd"):
+            return
+    rules.append(entry)
+    policy["shell__run_allow"] = rules
+    _save_tool_approval_policy(project_root, policy)
+
+
+def _normalize_shell_command(command: Any) -> str | None:
+    if not isinstance(command, str):
+        return None
+    one_line = " ".join(command.strip().splitlines()).strip()
+    return one_line if one_line else None
+
+
+def _shell_run_is_allowlisted(project_root: Path, args: dict[str, Any]) -> bool:
+    cmd = _normalize_shell_command(args.get("command"))
+    if not cmd:
+        return False
+    cwd = args.get("cwd")
+    cwd_s = str(cwd).strip() if isinstance(cwd, str) else None
+
+    policy = _load_tool_approval_policy(project_root)
+    rules = policy.get("shell__run_allow", [])
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        prefix = rule.get("command_prefix")
+        if not isinstance(prefix, str) or not prefix.strip():
+            continue
+        if not cmd.startswith(prefix.strip()):
+            continue
+        rule_cwd = rule.get("cwd")
+        if isinstance(rule_cwd, str) and rule_cwd.strip():
+            if cwd_s is None or cwd_s != rule_cwd.strip():
+                continue
+        return True
+    return False
 
 
 def _load_spec_proposal_record(project_root: Path, proposal_id: str) -> dict[str, Any]:
