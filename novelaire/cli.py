@@ -904,7 +904,11 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         out.append(
             UIEvent(
                 UIEventKind.TOOL_CALL_STARTED,
-                {"tool": payload.get("tool_name") or "tool", "call_id": payload.get("tool_call_id"), "summary": None},
+                {
+                    "tool": payload.get("tool_name") or "tool",
+                    "call_id": payload.get("tool_call_id"),
+                    "summary": payload.get("summary"),
+                },
             )
         )
         return out
@@ -916,6 +920,11 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
                 {
                     "tool": payload.get("tool_name") or "tool",
                     "call_id": payload.get("tool_call_id"),
+                    "summary": payload.get("summary"),
+                    "status": payload.get("status"),
+                    "duration_ms": payload.get("duration_ms"),
+                    "error_code": payload.get("error_code"),
+                    "error": payload.get("error"),
                     "ok": not bool(payload.get("error")),
                 },
             )
@@ -944,6 +953,9 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
     if kind == EventKind.APPROVAL_REQUIRED.value:
         approval_id = payload.get("approval_id") or ""
         summary = payload.get("action_summary") or ""
+        tool_summary = payload.get("summary")
+        if isinstance(tool_summary, str) and tool_summary.strip():
+            summary = f"{summary} ({tool_summary.strip()})"
         out.append(UIEvent(UIEventKind.WARNING, {"message": f"[approval] {approval_id}: {summary}".strip()}))
         return out
 
