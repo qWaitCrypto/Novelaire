@@ -29,6 +29,8 @@ class EventKind(str, Enum):
     TOOL_CALL_PROGRESS = "tool_call_progress"
     TOOL_CALL_END = "tool_call_end"
 
+    PLAN_UPDATE = "plan_update"
+
 
 class OpKind(str, Enum):
     CHAT = "chat"

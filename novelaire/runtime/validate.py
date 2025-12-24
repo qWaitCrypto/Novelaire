@@ -124,6 +124,7 @@ def _validate_events(events: list[Event], *, strict: bool) -> list[ValidationIss
         EventKind.LLM_REQUEST_FAILED.value,
         EventKind.TOOL_CALL_START.value,
         EventKind.TOOL_CALL_END.value,
+        EventKind.PLAN_UPDATE.value,
     }
     seen_ids: set[str] = set()
     session_ids: set[str] = set()
