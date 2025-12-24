@@ -77,6 +77,56 @@ class ConsoleUI:
         self._saw_thinking = False
         self._printed_think_preview = False
 
+        # Tool log buffering (Codex/Goose-style): group tool calls into a compact block
+        # and flush before the next LLM request starts.
+        self._pending_tool_items: list[tuple[str, str]] = []
+        self._pending_tool_omitted = 0
+
+    def _tool_category(self, tool_name: str) -> str:
+        if tool_name in {"project__read_text", "project__search_text"} or tool_name.startswith("skill__"):
+            return "Explored"
+        if tool_name in {"project__write_text", "project__text_editor"}:
+            return "Edited"
+        if tool_name == "update_plan":
+            return "Planned"
+        if tool_name.startswith("spec__"):
+            return "Spec"
+        if tool_name == "shell__run":
+            return "Ran"
+        return "Tools"
+
+    def _queue_tool_item(self, *, category: str, line: str) -> None:
+        self._pending_tool_items.append((category, line))
+        max_items = 40
+        if len(self._pending_tool_items) > max_items:
+            self._pending_tool_items = self._pending_tool_items[-max_items:]
+            self._pending_tool_omitted += 1
+
+    def _flush_tool_items(self) -> None:
+        if not self._pending_tool_items:
+            return
+        self._ensure_newline_if_streaming()
+
+        order = ["Explored", "Edited", "Planned", "Spec", "Ran", "Tools"]
+        groups: dict[str, list[str]] = {}
+        for cat, line in self._pending_tool_items:
+            groups.setdefault(cat, []).append(line)
+
+        for cat in order:
+            lines = groups.get(cat)
+            if not lines:
+                continue
+            self._println_dim(f"• {cat}")
+            for i, line in enumerate(lines):
+                prefix = "  └ " if i == 0 else "    "
+                self._println_dim(prefix + line)
+
+        if self._pending_tool_omitted:
+            self._println_dim(f"  ... ({self._pending_tool_omitted} earlier tool events omitted)")
+
+        self._pending_tool_items.clear()
+        self._pending_tool_omitted = 0
+
     # --- lifecycle ---
     def start(self) -> None:
         if self._thread is not None:
@@ -165,6 +215,8 @@ class ConsoleUI:
             return
 
         if k is UIEventKind.LLM_REQUEST_STARTED:
+            # Flush previous tool block (if any) before starting the next LLM request.
+            self._flush_tool_items()
             self._waiting_for_llm = True
             self._thinking_buf = ""
             self._spinner_frame = 0
@@ -229,21 +281,35 @@ class ConsoleUI:
             return
 
         if k is UIEventKind.TOOL_CALL_STARTED:
-            self._stop_waiting(clear_line=True)
-            self._ensure_newline_if_streaming()
-            tool = str(p.get("tool", "tool"))
-            self._println_dim(f"[tool] {tool} …")
+            # Tool calls are summarized on completion and flushed as a grouped block.
             return
 
         if k is UIEventKind.TOOL_CALL_COMPLETED:
-            self._stop_waiting(clear_line=True)
-            self._ensure_newline_if_streaming()
             tool = str(p.get("tool", "tool"))
-            ok = bool(p.get("ok", True))
-            if ok:
-                self._println_dim(f"[tool] {tool} done")
-            else:
-                self._println_red(f"[tool] {tool} failed")
+            summary = str(p.get("summary") or tool)
+            status = str(p.get("status") or ("succeeded" if bool(p.get("ok", True)) else "failed"))
+            duration_ms = p.get("duration_ms")
+            error_code = p.get("error_code")
+            error = p.get("error")
+
+            suffix_parts: list[str] = []
+            if isinstance(duration_ms, int) and duration_ms >= 500:
+                suffix_parts.append(f"{duration_ms}ms")
+            if status and status not in {"succeeded", "ok"}:
+                suffix_parts.append(status)
+            if error_code:
+                suffix_parts.append(str(error_code))
+            if error:
+                one_line = " ".join(str(error).splitlines()).strip()
+                if one_line:
+                    suffix_parts.append(one_line)
+
+            suffix = ""
+            if suffix_parts:
+                suffix = " (" + "; ".join(suffix_parts) + ")"
+
+            category = self._tool_category(tool)
+            self._queue_tool_item(category=category, line=summary + suffix)
             return
 
         if k is UIEventKind.PLAN_UPDATED:
@@ -317,6 +383,8 @@ class ConsoleUI:
             return
 
         if k is UIEventKind.ERROR_RAISED:
+            # Ensure any completed tool calls are visible before showing the error.
+            self._flush_tool_items()
             self._stop_waiting(clear_line=True)
             self._ensure_newline_if_streaming()
             msg = str(p.get("message", "") or "")

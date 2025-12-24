@@ -969,6 +969,7 @@ class Orchestrator:
             raise RuntimeError("Tool runtime not initialized.")
 
         for idx, planned in enumerate(planned_calls):
+            ui_summary = _summarize_tool_for_ui(planned.tool_name, planned.arguments)
             inspection = self.tool_runtime.inspect(planned)
             if inspection.decision is InspectionDecision.DENY:
                 code = inspection.error_code or ErrorCode.TOOL_DENIED
@@ -978,6 +979,7 @@ class Orchestrator:
                         "tool_execution_id": planned.tool_execution_id,
                         "tool_name": planned.tool_name,
                         "tool_call_id": planned.tool_call_id,
+                        "summary": ui_summary,
                         "status": "denied",
                         "error_code": code.value,
                         "error": inspection.reason or inspection.action_summary,
@@ -1032,6 +1034,7 @@ class Orchestrator:
                         "tool_execution_id": planned.tool_execution_id,
                         "tool_name": planned.tool_name,
                         "tool_call_id": planned.tool_call_id,
+                        "summary": ui_summary,
                         "arguments_ref": planned.arguments_ref.to_dict(),
                     },
                     request_id=request_id,
@@ -1046,6 +1049,7 @@ class Orchestrator:
                     "tool_execution_id": planned.tool_execution_id,
                     "tool_name": planned.tool_name,
                     "tool_call_id": planned.tool_call_id,
+                    "summary": ui_summary,
                     "arguments_ref": planned.arguments_ref.to_dict(),
                 },
                 request_id=request_id,
@@ -1061,6 +1065,7 @@ class Orchestrator:
                         "tool_execution_id": planned.tool_execution_id,
                         "tool_name": planned.tool_name,
                         "tool_call_id": planned.tool_call_id,
+                        "summary": ui_summary,
                         "status": "cancelled",
                         "duration_ms": 0,
                         "output_ref": None,
@@ -1094,6 +1099,7 @@ class Orchestrator:
                     "tool_execution_id": result.tool_execution_id,
                     "tool_name": result.tool_name,
                     "tool_call_id": result.tool_call_id,
+                    "summary": ui_summary,
                     "status": result.status,
                     "duration_ms": result.duration_ms,
                     "output_ref": result.output_ref.to_dict() if result.output_ref is not None else None,
@@ -1443,6 +1449,75 @@ def _summarize_text(text: str, *, max_len: int = 160) -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - 1] + "…"
+
+
+def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
+    def _q(s: str) -> str:
+        # Quote without backticks so terminals that don't render markdown still look OK.
+        return f'"{s}"'
+
+    if tool_name == "project__read_text":
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            return f"Read {_q(path)}"
+        return "Read file"
+
+    if tool_name == "project__search_text":
+        query = arguments.get("query")
+        path = arguments.get("path")
+        if isinstance(query, str) and query:
+            if isinstance(path, str) and path:
+                return f"Search {_q(query)} in {_q(path)}"
+            return f"Search {_q(query)}"
+        return "Search text"
+
+    if tool_name == "project__write_text":
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            return f'Write {_q(path)}'
+        return "Write file"
+
+    if tool_name == "project__text_editor":
+        command = arguments.get("command")
+        path = arguments.get("path")
+        if isinstance(command, str) and isinstance(path, str) and path:
+            return f"Edit {_q(path)} ({command})"
+        if isinstance(path, str) and path:
+            return f"Edit {_q(path)}"
+        return "Edit file"
+
+    if tool_name == "shell__run":
+        command = arguments.get("command")
+        if isinstance(command, str) and command.strip():
+            one_line = " ".join(command.strip().splitlines()).strip()
+            if len(one_line) > 80:
+                one_line = one_line[:79] + "…"
+            return f"Run $ {one_line}"
+        return "Run shell command"
+
+    if tool_name == "update_plan":
+        return "Update plan"
+
+    if tool_name.startswith("skill__"):
+        name = arguments.get("name")
+        if isinstance(name, str) and name:
+            return f"Skill {tool_name} ({_q(name)})"
+        return f"Skill {tool_name}"
+
+    if tool_name.startswith("spec__"):
+        if tool_name == "spec__apply":
+            proposal_id = arguments.get("proposal_id")
+            if isinstance(proposal_id, str) and proposal_id:
+                return f"Spec apply ({_q(proposal_id)})"
+            return "Spec apply"
+        if tool_name == "spec__seal":
+            label = arguments.get("label")
+            if isinstance(label, str) and label:
+                return f"Spec seal ({_q(label)})"
+            return "Spec seal"
+        return f"Spec {tool_name}"
+
+    return tool_name
 
 
 def _canonical_request_to_redacted_dict(request: CanonicalRequest) -> dict[str, Any]:
