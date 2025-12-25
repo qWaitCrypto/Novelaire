@@ -8,6 +8,7 @@ from typing import Any
 class ProviderKind(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"
     ANTHROPIC = "anthropic"
+    GEMINI_INTERNAL = "gemini_internal"
 
 
 class ModelRole(StrEnum):
@@ -25,6 +26,8 @@ class CredentialRef:
     identifier: str
 
     def to_redacted_string(self) -> str:
+        if self.kind in {"inline", "plaintext"}:
+            return f"{self.kind}:***"
         return f"{self.kind}:{self.identifier}"
 
 
@@ -42,17 +45,17 @@ class ModelCapabilities:
 
     def with_provider_defaults(self, provider_kind: ProviderKind) -> "ModelCapabilities":
         supports_streaming = self.supports_streaming
-        if supports_streaming is None and provider_kind in (
-            ProviderKind.OPENAI_COMPATIBLE,
-            ProviderKind.ANTHROPIC,
-        ):
-            supports_streaming = True
+        if supports_streaming is None:
+            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC):
+                supports_streaming = True
+            elif provider_kind is ProviderKind.GEMINI_INTERNAL:
+                supports_streaming = False
         supports_tools = self.supports_tools
-        if supports_tools is None and provider_kind in (
-            ProviderKind.OPENAI_COMPATIBLE,
-            ProviderKind.ANTHROPIC,
-        ):
-            supports_tools = True
+        if supports_tools is None:
+            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC):
+                supports_tools = True
+            elif provider_kind is ProviderKind.GEMINI_INTERNAL:
+                supports_tools = True
         return ModelCapabilities(
             supports_tools=supports_tools,
             supports_structured_output=self.supports_structured_output,
@@ -119,6 +122,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     raw_arguments: str | None = None
+    thought_signature: str | None = None
 
 
 @dataclass(frozen=True)

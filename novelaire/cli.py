@@ -14,6 +14,7 @@ from .runtime.project import RuntimePaths
 from .runtime.approval import ApprovalStatus
 from .runtime.protocol import ArtifactRef, EventKind, Op, OpKind
 from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
+from .runtime.llm.config import ModelConfig
 from .runtime.llm.config_io import load_model_config_layers_for_dir
 from .runtime.llm.types import ModelRole
 from .runtime.skills import seed_builtin_skills
@@ -110,6 +111,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable tool calling.",
     )
+    chat_parser.add_argument(
+        "--max-tool-turns",
+        dest="max_tool_turns",
+        type=int,
+        default=30,
+        help="Max model+tool turns per user message (default: 30, max: 256).",
+    )
     chat_parser.set_defaults(enable_tools=None)
     chat_parser.set_defaults(func=_cmd_chat)
 
@@ -137,6 +145,13 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="enable_tools",
         action="store_false",
         help="Disable tool calling.",
+    )
+    session_resume_parser.add_argument(
+        "--max-tool-turns",
+        dest="max_tool_turns",
+        type=int,
+        default=30,
+        help="Max model+tool turns per user message (default: 30, max: 256).",
     )
     session_resume_parser.set_defaults(enable_tools=None)
     session_resume_parser.set_defaults(func=_cmd_session_resume)
@@ -190,19 +205,9 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     try:
         layers = load_model_config_layers_for_dir(paths.project_root, require_project=True)
-        model_config = layers.merged()
     except Exception as e:
         print(str(e), file=sys.stderr)
         return EXIT_CONFIG_ERROR
-
-    enable_tools = getattr(args, "enable_tools", None)
-    if enable_tools is None:
-        profile = model_config.get_profile_for_role(ModelRole.MAIN)
-        if profile is None:
-            enable_tools = False
-        else:
-            caps = profile.capabilities.with_provider_defaults(profile.provider_kind)
-            enable_tools = caps.supports_tools is True
 
     # Default: require approval only for high-risk operations (shell commands).
     default_approval_mode = ToolApprovalMode.STANDARD
@@ -223,6 +228,31 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             print(str(e), file=sys.stderr)
             return EXIT_CONFIG_ERROR
 
+    # Apply any session-level chat model selection.
+    chat_profile_id = session_meta.get("chat_profile_id")
+    if isinstance(chat_profile_id, str) and chat_profile_id.strip():
+        layers.session_config = ModelConfig(role_pointers={ModelRole.MAIN: chat_profile_id.strip()})
+
+    try:
+        model_config = layers.merged()
+    except Exception as e:
+        # If the session stored an invalid profile id, fall back to config defaults.
+        layers.session_config = None
+        try:
+            model_config = layers.merged()
+        except Exception:
+            print(str(e), file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+
+    enable_tools = getattr(args, "enable_tools", None)
+    if enable_tools is None:
+        profile = model_config.get_profile_for_role(ModelRole.MAIN)
+        if profile is None:
+            enable_tools = False
+        else:
+            caps = profile.capabilities.with_provider_defaults(profile.provider_kind)
+            enable_tools = caps.supports_tools is True
+
     raw_mode = session_meta.get("tool_approval_mode")
     try:
         approval_mode = ToolApprovalMode(str(raw_mode)) if raw_mode else default_approval_mode
@@ -242,6 +272,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         model_config=model_config,
         system_prompt=args.system_prompt,
         tools_enabled=bool(enable_tools),
+        max_tool_turns=args.max_tool_turns,
     )
     if orchestrator.tool_runtime is not None:
         orchestrator.tool_runtime.set_approval_mode(approval_mode)
@@ -317,7 +348,7 @@ def _run_chat_console_ui(
             from prompt_toolkit.keys import Keys
 
             class _SlashCompleter(Completer):
-                _cmds = ["/help", "/clear", "/perm", "/exit", "/quit"]
+                _cmds = ["/help", "/clear", "/perm", "/model", "/exit", "/quit"]
 
                 def get_completions(self, document, complete_event):
                     text = document.text_before_cursor
@@ -595,13 +626,60 @@ def _run_chat_console_ui(
                     UIEventKind.LOG,
                     {
                         "level": "help",
-                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /exit quits.",
+                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /model selects chat model; /exit quits.",
                     },
                 )
             )
             continue
         if cmd == "/clear":
             ui.emit(UIEvent(UIEventKind.CLEAR_SCREEN, {}))
+            continue
+        if cmd.startswith("/model"):
+            parts = cmd.split()
+            cfg = orchestrator.model_config
+            current_profile_id = cfg.role_pointers.get(ModelRole.MAIN)
+            if len(parts) == 1 or parts[1] in {"list", "ls"}:
+                current_desc = "(unset)"
+                if isinstance(current_profile_id, str) and current_profile_id in cfg.profiles:
+                    p = cfg.profiles[current_profile_id]
+                    current_desc = f"{current_profile_id} ({p.provider_kind.value} {p.model_name})"
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Chat model: {current_desc}"}))
+                if not cfg.profiles:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "No model profiles configured."}))
+                    continue
+                lines = ["Available profiles:"]
+                for pid in sorted(cfg.profiles.keys()):
+                    p = cfg.profiles[pid]
+                    mark = "*" if pid == current_profile_id else " "
+                    lines.append(f"  {mark} {pid}: {p.provider_kind.value} {p.model_name}")
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "\n".join(lines)}))
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Usage: /model set <profile-id>"}))
+                continue
+            if len(parts) >= 3 and parts[1] in {"set", "use"}:
+                target = parts[2].strip()
+                if not target:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model set <profile-id>"}))
+                    continue
+                if target not in cfg.profiles:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Unknown model profile: {target}"}))
+                    continue
+                try:
+                    orchestrator.set_chat_model_profile(target)
+                except Exception as e:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Failed to switch model: {e}"}))
+                    continue
+                try:
+                    orchestrator.session_store.update_session(orchestrator.session_id, {"chat_profile_id": target})
+                except Exception:
+                    pass
+                p = cfg.profiles[target]
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Chat model set to: {target} ({p.provider_kind.value} {p.model_name})"}))
+                if orchestrator.tools_enabled:
+                    caps = p.capabilities.with_provider_defaults(p.provider_kind)
+                    if caps.supports_tools is not True:
+                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Selected model does not declare tool support; tool calls may fail."}))
+                continue
+            ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model set <profile-id>"}))
             continue
         if cmd.startswith("/perm"):
             parts = cmd.split()
@@ -816,6 +894,7 @@ def _cmd_session_resume(args: argparse.Namespace) -> int:
         timeout_s=args.timeout_s,
         system_prompt=args.system_prompt,
         enable_tools=getattr(args, "enable_tools", None),
+        max_tool_turns=getattr(args, "max_tool_turns", 30),
     )
     return _cmd_chat(args2)
 
@@ -1060,6 +1139,17 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
     if kind == EventKind.LLM_REQUEST_FAILED.value:
         msg = payload.get("error") or str(payload)
         code = payload.get("error_code") or payload.get("code") or "llm_request_failed"
+        handled = payload.get("handled")
+        if handled == "fallback_to_complete":
+            out.append(
+                UIEvent(
+                    UIEventKind.WARNING,
+                    {
+                        "message": f"{code}: streaming failed, retried without streaming",
+                    },
+                )
+            )
+            return out
         details = payload.get("details")
         if code == "timeout" and isinstance(details, dict):
             phase = details.get("phase")
@@ -1201,49 +1291,51 @@ def _cmd_init(args: argparse.Namespace) -> int:
     for directory in [*author_dirs, *system_dirs]:
         directory.mkdir(parents=True, exist_ok=True)
 
-    env_path = project_root / ".novelaire" / "config" / "env"
-    if not env_path.exists():
-        env_path.write_text(
+    models_path = project_root / ".novelaire" / "config" / "models.json"
+    if not models_path.exists():
+        models_path.write_text(
             "\n".join(
                 [
-                    "# Novelaire project configuration (v0.1)",
-                    "#",
-                    "# Fill at least one provider config, then run:",
-                    "#   python -m novelaire chat",
-                    "#",
-                    "# Required:",
-                    "#   NOVELAIRE_PROVIDER_KIND   = openai_compatible | anthropic",
-                    "#   NOVELAIRE_BASE_URL        = endpoint base URL",
-                    "#   NOVELAIRE_MODEL           = model name",
-                    "# Optional:",
-                    "#   NOVELAIRE_API_KEY         = API key (allowed as plaintext in this local-only workflow)",
-                    "#   NOVELAIRE_TIMEOUT_S       = per-request timeout seconds",
-                    "#   NOVELAIRE_MAX_TOKENS      = max output tokens (REQUIRED for anthropic)",
-                    "#   NOVELAIRE_SUPPORTS_TOOLS  = 0/1",
-                    "#   NOVELAIRE_TRACE_LLM       = 0/1 (write LLM request/response traces for debugging)",
-                    "#   NOVELAIRE_TRACE_LLM_DIR   = optional override directory for traces",
-                    "",
-                    "# --- OpenAI-compatible example (vLLM/TGI/llama.cpp/OpenAI/OpenRouter proxy etc.) ---",
-                    "NOVELAIRE_PROVIDER_KIND=openai_compatible",
-                    "NOVELAIRE_BASE_URL=http://127.0.0.1:8000/v1",
-                    "NOVELAIRE_MODEL=your-model-name",
-                    "# NOVELAIRE_API_KEY=replace-me  # optional for many local/proxied endpoints",
-                    "NOVELAIRE_TIMEOUT_S=60",
-                    "NOVELAIRE_SUPPORTS_TOOLS=1",
-                    "# NOVELAIRE_TRACE_LLM=0",
-                    "",
-                    "# --- Anthropic example ---",
-                    "# NOVELAIRE_PROVIDER_KIND=anthropic",
-                    "# NOVELAIRE_BASE_URL=https://api.anthropic.com",
-                    "# NOVELAIRE_MODEL=claude-3-5-sonnet-20241022",
-                    "# NOVELAIRE_API_KEY=replace-me",
-                    "# NOVELAIRE_MAX_TOKENS=1024",
-                    "# NOVELAIRE_SUPPORTS_TOOLS=1",
-                    "# NOVELAIRE_TRACE_LLM=0",
+                    "{",
+                    '  "default_profile": "main",',
+                    '  "profiles": {',
+                    '    "main": {',
+                    '      "provider_kind": "openai_compatible",',
+                    '      "base_url": "",',
+                    '      "model": "your-model-name",',
+                    '      "api_key": "",',
+                    '      "timeout_s": 60,',
+                    '      "capabilities": { "supports_tools": true, "supports_streaming": true }',
+                    "    },",
+                    '    "anthropic": {',
+                    '      "provider_kind": "anthropic",',
+                    '      "base_url": "",',
+                    '      "model": "claude-3-5-sonnet-20241022",',
+                    '      "api_key": "replace-me",',
+                    '      "max_tokens": 1024,',
+                    '      "timeout_s": 60,',
+                    '      "capabilities": { "supports_tools": true, "supports_streaming": true }',
+                    "    },",
+                    '    "gemini_internal": {',
+                    '      "provider_kind": "gemini_internal",',
+                    '      "base_url": "",',
+                    '      "model": "gemini-3-flash",',
+                    '      "api_key": "replace-me",',
+                    '      "timeout_s": 60,',
+                    '      "capabilities": { "supports_tools": true, "supports_streaming": false },',
+                    '      "default_params": {',
+                    '        "project": "",',
+                    '        "session_id": "",',
+                    '        "generationConfig": {',
+                    '          "thinkingConfig": { "includeThoughts": false }',
+                    "        }",
+                    "      }",
+                    "    }",
+                    "  }",
+                    "}",
                     "",
                 ]
-            )
-            + "\n",
+            ),
             encoding="utf-8",
         )
 

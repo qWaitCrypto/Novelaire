@@ -195,6 +195,7 @@ class LLMTrace:
                                     "name": tc.name,
                                     "arguments": tc.arguments,
                                     "raw_arguments": tc.raw_arguments,
+                                    "thought_signature": tc.thought_signature,
                                 }
                                 for tc in (m.tool_calls or [])
                             ]
