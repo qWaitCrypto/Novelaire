@@ -478,9 +478,13 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         tools_enabled=bool(enable_tools),
         max_tool_turns=args.max_tool_turns,
     )
+    memory_summary = session_meta.get("memory_summary")
+    if isinstance(memory_summary, str) and memory_summary.strip():
+        orchestrator.memory_summary = memory_summary
     if orchestrator.tool_runtime is not None:
         orchestrator.tool_runtime.set_approval_mode(approval_mode)
     orchestrator.load_history_from_events()
+    orchestrator.apply_memory_summary_retention()
 
     return _run_chat_line_mode(
         orchestrator=orchestrator,
@@ -533,6 +537,7 @@ def _run_chat_console_ui(
     from contextlib import contextmanager
 
     from .runtime.llm.errors import CancellationToken
+    from .runtime.context_mgmt import render_context_left_line
     from .ui.console_ui import ConsoleUI, ThinkTagParser, UIEvent, UIEventKind
 
     def _is_tty() -> bool:
@@ -543,6 +548,7 @@ def _run_chat_console_ui(
 
     # Input: prompt_toolkit if available in a TTY; otherwise basic input().
     prompt_session = None
+    status_bar = {"context": "100% context left"}
     if _is_tty():
         try:
             from prompt_toolkit import PromptSession
@@ -552,7 +558,7 @@ def _run_chat_console_ui(
             from prompt_toolkit.keys import Keys
 
             class _SlashCompleter(Completer):
-                _cmds = ["/help", "/clear", "/perm", "/model", "/exit", "/quit"]
+                _cmds = ["/help", "/clear", "/perm", "/model", "/compact", "/exit", "/quit"]
 
                 def get_completions(self, document, complete_event):
                     text = document.text_before_cursor
@@ -583,6 +589,7 @@ def _run_chat_console_ui(
                 key_bindings=kb,
                 completer=_SlashCompleter(),
                 history=FileHistory(str(history_path)),
+                bottom_toolbar=lambda: status_bar["context"],
             )
         except Exception:
             prompt_session = None
@@ -603,6 +610,27 @@ def _run_chat_console_ui(
     think_parser = ThinkTagParser()
 
     def _on_runtime_event(event) -> None:
+        try:
+            if event.kind in {
+                EventKind.LLM_REQUEST_STARTED.value,
+                EventKind.LLM_RESPONSE_COMPLETED.value,
+                EventKind.OPERATION_COMPLETED.value,
+            }:
+                payload = event.payload if isinstance(event.payload, dict) else {}
+                cs = payload.get("context_stats")
+                if isinstance(cs, dict):
+                    used = cs.get("input_tokens")
+                    if not isinstance(used, int):
+                        used = cs.get("estimated_input_tokens")
+                    limit = cs.get("context_limit_tokens")
+                    if not isinstance(limit, int):
+                        limit = None
+                    status_bar["context"] = render_context_left_line(
+                        used_tokens=used if isinstance(used, int) else None,
+                        context_limit_tokens=limit if isinstance(limit, int) else None,
+                    )
+        except Exception:
+            pass
         for uiev in _runtime_event_to_ui_events(event, think_parser=think_parser):
             ui.emit(uiev)
 
@@ -1029,13 +1057,30 @@ def _run_chat_console_ui(
                     UIEventKind.LOG,
                     {
                         "level": "help",
-                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /model selects chat model; /exit quits.",
+                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /model selects chat model; /compact summarizes and prunes history; /exit quits.",
                     },
                 )
             )
             continue
         if cmd == "/clear":
             ui.emit(UIEvent(UIEventKind.CLEAR_SCREEN, {}))
+            continue
+        if cmd == "/compact":
+            op = Op(
+                kind=OpKind.COMPACT.value,
+                payload={},
+                session_id=session_id,
+                request_id=new_id("req"),
+                timestamp=now_ts_ms(),
+                turn_id=new_id("turn"),
+            )
+            cancel = CancellationToken()
+            t = threading.Thread(
+                target=lambda: orchestrator.handle(op, timeout_s=timeout_s, cancel=cancel),
+                daemon=True,
+            )
+            t.start()
+            _wait_with_ctrl_c(t, cancel)
             continue
         if cmd.startswith("/model"):
             parts = cmd.split()
@@ -1478,6 +1523,26 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         out.append(UIEvent(UIEventKind.LLM_REQUEST_STARTED, {"request_id": event.request_id}))
         return out
 
+    if kind == EventKind.OPERATION_STARTED.value:
+        if payload.get("op_kind") == OpKind.COMPACT.value:
+            try:
+                think_parser.reset()
+            except Exception:
+                pass
+            out.append(
+                UIEvent(
+                    UIEventKind.LLM_REQUEST_STARTED,
+                    {"request_id": event.request_id, "label": "Compacting"},
+                )
+            )
+        return out
+
+    if kind == EventKind.OPERATION_COMPLETED.value:
+        if payload.get("op_kind") == OpKind.COMPACT.value:
+            out.append(UIEvent(UIEventKind.ASSISTANT_COMPLETED, {"finish_reason": None}))
+            out.append(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Compaction complete."}))
+        return out
+
     if kind == EventKind.LLM_THINKING_DELTA.value:
         delta = str(payload.get("thinking_delta") or "")
         if delta:
@@ -1560,6 +1625,7 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         return out
 
     if kind == EventKind.OPERATION_CANCELLED.value:
+        out.append(UIEvent(UIEventKind.ASSISTANT_COMPLETED, {"finish_reason": None}))
         reason = payload.get("reason") or "cancelled"
         out.append(UIEvent(UIEventKind.CANCELLED, {"message": str(reason)}))
         return out
@@ -1602,6 +1668,8 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         return out
 
     if kind == EventKind.OPERATION_FAILED.value:
+        if payload.get("op_kind") == OpKind.COMPACT.value:
+            out.append(UIEvent(UIEventKind.ASSISTANT_COMPLETED, {"finish_reason": None}))
         # Avoid duplicate error lines for LLM failures: LLM_REQUEST_FAILED already surfaced it.
         if payload.get("type") == "llm_request":
             return out
@@ -1733,6 +1801,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     '      "model": "your-model-name",',
                     '      "api_key": "",',
                     '      "timeout_s": 60,',
+                    '      "limits": { "context_limit_tokens": null, "max_output_tokens": null },',
+                    '      "context_management": {',
+                    '        "auto_compact_threshold_ratio": null,',
+                    '        "history_budget_ratio": 0.2,',
+                    '        "history_budget_fallback_tokens": 8000,',
+                    '        "tool_output_budget_tokens": 400',
+                    "      },",
                     '      "capabilities": { "supports_tools": true, "supports_streaming": true }',
                     "    },",
                     '    "anthropic": {',
@@ -1742,6 +1817,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     '      "api_key": "replace-me",',
                     '      "max_tokens": 1024,',
                     '      "timeout_s": 60,',
+                    '      "limits": { "context_limit_tokens": null, "max_output_tokens": null },',
+                    '      "context_management": {',
+                    '        "auto_compact_threshold_ratio": null,',
+                    '        "history_budget_ratio": 0.2,',
+                    '        "history_budget_fallback_tokens": 8000,',
+                    '        "tool_output_budget_tokens": 400',
+                    "      },",
                     '      "capabilities": { "supports_tools": true, "supports_streaming": true }',
                     "    },",
                     '    "gemini_internal": {',
@@ -1750,6 +1832,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     '      "model": "gemini-3-flash",',
                     '      "api_key": "replace-me",',
                     '      "timeout_s": 60,',
+                    '      "limits": { "context_limit_tokens": null, "max_output_tokens": null },',
+                    '      "context_management": {',
+                    '        "auto_compact_threshold_ratio": null,',
+                    '        "history_budget_ratio": 0.2,',
+                    '        "history_budget_fallback_tokens": 8000,',
+                    '        "tool_output_budget_tokens": 400',
+                    "      },",
                     '      "capabilities": { "supports_tools": true, "supports_streaming": false },',
                     '      "default_params": {',
                     '        "project": "",',

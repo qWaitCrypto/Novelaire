@@ -8,6 +8,7 @@ from typing import Any
 from .config import ModelConfig, ModelConfigLayers
 from .errors import ModelConfigError
 from .types import (
+    ContextManagementConfig,
     CredentialRef,
     ModelCapabilities,
     ModelLimits,
@@ -156,6 +157,8 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
             "max_tokens",
             "default_params",
             "capabilities",
+            "limits",
+            "context_management",
         },
         ctx=f"{source}:profiles.{profile_id}",
     )
@@ -242,6 +245,31 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
             ),
         )
 
+    limits = None
+    if "limits" in profile_dict and profile_dict["limits"] is not None:
+        lim = _ensure_dict(profile_dict["limits"], ctx=f"{source}:profiles.{profile_id}.limits")
+        _assert_known_keys(
+            lim,
+            allowed={"context_limit_tokens", "max_output_tokens"},
+            ctx=f"{source}:profiles.{profile_id}.limits",
+        )
+        limits = ModelLimits(
+            context_limit_tokens=_maybe_int(
+                lim.get("context_limit_tokens"),
+                ctx=f"{source}:profiles.{profile_id}.limits.context_limit_tokens",
+            ),
+            max_output_tokens=_maybe_int(
+                lim.get("max_output_tokens"),
+                ctx=f"{source}:profiles.{profile_id}.limits.max_output_tokens",
+            ),
+        )
+
+    context_management = None
+    if "context_management" in profile_dict and profile_dict["context_management"] is not None:
+        context_management = _parse_context_management(
+            profile_dict["context_management"], ctx=f"{source}:profiles.{profile_id}.context_management"
+        )
+
     return ModelProfile(
         profile_id=profile_id,
         provider_kind=provider_kind,
@@ -252,7 +280,8 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
         default_params=default_params,
         capabilities=capabilities,
         tags=set(),
-        limits=None,
+        limits=limits,
+        context_management=context_management,
     )
 
 def load_model_config_env_file(path: Path) -> ModelConfig:
@@ -395,6 +424,7 @@ def load_model_config_from_env(env: dict[str, str], *, source: str) -> ModelConf
         capabilities=capabilities,
         tags=set(),
         limits=None,
+        context_management=None,
     )
     return ModelConfig(profiles={"main": profile}, role_pointers={ModelRole.MAIN: "main"})
 
@@ -502,6 +532,7 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
             "capabilities",
             "tags",
             "limits",
+            "context_management",
             "profile_id",
         },
         ctx=f"{source}:profiles.{profile_id}",
@@ -594,6 +625,12 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
             ),
         )
 
+    context_management = None
+    if "context_management" in profile_dict and profile_dict["context_management"] is not None:
+        context_management = _parse_context_management(
+            profile_dict["context_management"], ctx=f"{source}:profiles.{profile_id}.context_management"
+        )
+
     return ModelProfile(
         profile_id=profile_id,
         provider_kind=provider_kind,
@@ -605,6 +642,7 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
         capabilities=capabilities,
         tags=tags,
         limits=limits,
+        context_management=context_management,
     )
 
 
@@ -649,7 +687,52 @@ def _profile_to_dict(profile: ModelProfile) -> dict[str, Any]:
             limits["max_output_tokens"] = profile.limits.max_output_tokens
         out["limits"] = limits
 
+    if profile.context_management is not None:
+        cm = profile.context_management
+        cm_dict: dict[str, Any] = {}
+        if cm.auto_compact_threshold_ratio is not None:
+            cm_dict["auto_compact_threshold_ratio"] = cm.auto_compact_threshold_ratio
+        if cm.history_budget_ratio is not None:
+            cm_dict["history_budget_ratio"] = cm.history_budget_ratio
+        if cm.history_budget_fallback_tokens is not None:
+            cm_dict["history_budget_fallback_tokens"] = cm.history_budget_fallback_tokens
+        if cm.tool_output_budget_tokens is not None:
+            cm_dict["tool_output_budget_tokens"] = cm.tool_output_budget_tokens
+        if cm_dict:
+            out["context_management"] = cm_dict
+
     return out
+
+
+def _parse_context_management(value: Any, *, ctx: str) -> ContextManagementConfig:
+    obj = _ensure_dict(value, ctx=ctx)
+    _assert_known_keys(
+        obj,
+        allowed={
+            "auto_compact_threshold_ratio",
+            "history_budget_ratio",
+            "history_budget_fallback_tokens",
+            "tool_output_budget_tokens",
+        },
+        ctx=ctx,
+    )
+    auto_ratio = _maybe_float(obj.get("auto_compact_threshold_ratio"), ctx=f"{ctx}.auto_compact_threshold_ratio")
+    history_ratio = _maybe_float(obj.get("history_budget_ratio"), ctx=f"{ctx}.history_budget_ratio")
+    fallback_tokens = _maybe_int(obj.get("history_budget_fallback_tokens"), ctx=f"{ctx}.history_budget_fallback_tokens")
+    tool_budget = _maybe_int(obj.get("tool_output_budget_tokens"), ctx=f"{ctx}.tool_output_budget_tokens")
+
+    if history_ratio is not None and not (0.0 < history_ratio <= 1.0):
+        raise ModelConfigError(f"{ctx}.history_budget_ratio must be > 0 and <= 1")
+    if fallback_tokens is not None and fallback_tokens <= 0:
+        raise ModelConfigError(f"{ctx}.history_budget_fallback_tokens must be > 0")
+    if tool_budget is not None and tool_budget < 0:
+        raise ModelConfigError(f"{ctx}.tool_output_budget_tokens must be >= 0")
+    return ContextManagementConfig(
+        auto_compact_threshold_ratio=auto_ratio,
+        history_budget_ratio=history_ratio,
+        history_budget_fallback_tokens=fallback_tokens,
+        tool_output_budget_tokens=tool_budget,
+    )
 
 
 def _ensure_dict(value: Any, *, ctx: str) -> dict[str, Any]:

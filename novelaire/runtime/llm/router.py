@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .config import ModelConfig
 from .errors import ModelResolutionError
 from .types import ModelCapabilities, ModelProfile, ModelRequirements, ModelRole
+from ..context_mgmt import resolve_context_limit_tokens
 
 
 @dataclass(frozen=True)
@@ -70,16 +71,12 @@ class ModelRouter:
                 profile_id=profile.profile_id,
             )
         if requirements.min_context_tokens is not None:
-            if profile.limits is None or profile.limits.context_limit_tokens is None:
-                raise ModelResolutionError(
-                    f"Profile '{profile.profile_id}' does not declare a context limit.",
-                    role=None,
-                    profile_id=profile.profile_id,
-                )
-            if profile.limits.context_limit_tokens < requirements.min_context_tokens:
+            limit = resolve_context_limit_tokens(
+                profile.limits.context_limit_tokens if profile.limits is not None else None
+            )
+            if limit < requirements.min_context_tokens:
                 raise ModelResolutionError(
                     f"Profile '{profile.profile_id}' context limit is too small.",
                     role=None,
                     profile_id=profile.profile_id,
                 )
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -13,6 +13,19 @@ from .event_bus import EventBus
 from .ids import new_id, now_ts_ms
 from .protocol import Event, EventKind, Op, OpKind
 from .stores import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
+from .context_mgmt import (
+    approx_tokens_from_json,
+    canonical_request_to_dict,
+    compute_context_left_percent,
+    resolve_context_limit_tokens,
+)
+from .compaction import (
+    apply_compaction_retention,
+    build_compaction_request,
+    load_compact_prompt_text,
+    settings_for_profile,
+    should_auto_compact,
+)
 
 from .llm.client import LLMClient
 from .llm.config import ModelConfig
@@ -89,7 +102,9 @@ class Orchestrator:
     tool_registry: ToolRegistry | None = None
     tool_runtime: ToolRuntime | None = None
     system_prompt: str | None = None
+    memory_summary: str | None = None
     _history: list[CanonicalMessage] | None = None
+    _auto_compact_seen_turn_ids: set[str] = field(default_factory=set)
     schema_version: str = "0.1"
 
     @staticmethod
@@ -255,6 +270,9 @@ class Orchestrator:
         if op.kind == OpKind.CHAT.value:
             self._handle_chat(op, timeout_s=timeout_s, cancel=cancel)
             return
+        if op.kind == OpKind.COMPACT.value:
+            self._handle_compact(op, timeout_s=timeout_s, cancel=cancel)
+            return
 
         raise NotImplementedError(f"Unsupported op kind: {op.kind}")
 
@@ -364,6 +382,24 @@ class Orchestrator:
             cancel=cancel,
         )
 
+    def _handle_compact(
+        self,
+        op: Op,
+        *,
+        timeout_s: float | None,
+        cancel: CancellationToken | None = None,
+    ) -> None:
+        cancel = cancel or CancellationToken()
+        ok = self._perform_compaction(
+            trigger="manual",
+            request_id=op.request_id,
+            turn_id=op.turn_id,
+            timeout_s=timeout_s,
+            cancel=cancel,
+        )
+        if not ok:
+            return
+
     def _continue_chat_operation(
         self,
         *,
@@ -377,59 +413,105 @@ class Orchestrator:
         if self.tool_registry is None or self.tool_runtime is None:
             raise RuntimeError("Tool runtime not initialized.")
 
-        for turn_index in range(self.max_tool_turns):
-            step_id = new_id("step")
-            request = self._build_request()
-            requirements = ModelRequirements(
-                needs_tools=bool(request.tools),
-            )
-            try:
-                resolved = self.model_router.resolve(role=ModelRole.MAIN, requirements=requirements)
-            except ModelResolutionError as e:
-                self._emit(
-                    kind=EventKind.MODEL_RESOLUTION_FAILED,
-                    payload={
-                        "role": ModelRole.MAIN.value,
-                        "error": str(e),
-                        "error_code": ErrorCode.MODEL_RESOLUTION.value,
-                        "details": getattr(e, "details", None),
-                    },
-                    request_id=request_id,
-                    turn_id=turn_id,
-                    step_id=step_id,
-                )
-                self._emit(
-                    kind=EventKind.OPERATION_FAILED,
-                    payload={
-                        "error": str(e),
-                        "error_code": ErrorCode.MODEL_RESOLUTION.value,
-                        "type": "model_resolution",
-                    },
-                    request_id=request_id,
-                    turn_id=turn_id,
-                    step_id=step_id,
-                )
-                return
+        guard_id = str(turn_id or request_id)
 
-            self._emit(
-                kind=EventKind.MODEL_SELECTED,
-                payload={
-                    "role": resolved.role.value,
-                    "profile_id": resolved.profile.profile_id,
-                    "provider_kind": resolved.profile.provider_kind.value,
-                    "model_name": resolved.profile.model_name,
-                    "requirements": {
-                        "needs_streaming": resolved.requirements.needs_streaming,
-                        "needs_tools": resolved.requirements.needs_tools,
-                        "needs_structured_output": resolved.requirements.needs_structured_output,
-                        "min_context_tokens": resolved.requirements.min_context_tokens,
+        for turn_index in range(self.max_tool_turns):
+            while True:
+                step_id = new_id("step")
+                request = self._build_request()
+                requirements = ModelRequirements(
+                    needs_tools=bool(request.tools),
+                )
+                try:
+                    resolved = self.model_router.resolve(role=ModelRole.MAIN, requirements=requirements)
+                except ModelResolutionError as e:
+                    self._emit(
+                        kind=EventKind.MODEL_RESOLUTION_FAILED,
+                        payload={
+                            "role": ModelRole.MAIN.value,
+                            "error": str(e),
+                            "error_code": ErrorCode.MODEL_RESOLUTION.value,
+                            "details": getattr(e, "details", None),
+                        },
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                    )
+                    self._emit(
+                        kind=EventKind.OPERATION_FAILED,
+                        payload={
+                            "error": str(e),
+                            "error_code": ErrorCode.MODEL_RESOLUTION.value,
+                            "type": "model_resolution",
+                        },
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                    )
+                    return
+
+                self._emit(
+                    kind=EventKind.MODEL_SELECTED,
+                    payload={
+                        "role": resolved.role.value,
+                        "profile_id": resolved.profile.profile_id,
+                        "provider_kind": resolved.profile.provider_kind.value,
+                        "model_name": resolved.profile.model_name,
+                        "requirements": {
+                            "needs_streaming": resolved.requirements.needs_streaming,
+                            "needs_tools": resolved.requirements.needs_tools,
+                            "needs_structured_output": resolved.requirements.needs_structured_output,
+                            "min_context_tokens": resolved.requirements.min_context_tokens,
+                        },
+                        "why": resolved.why,
                     },
-                    "why": resolved.why,
-                },
-                request_id=request_id,
-                turn_id=turn_id,
-                step_id=step_id,
-            )
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+
+                context_limit_tokens = resolve_context_limit_tokens(
+                    resolved.profile.limits.context_limit_tokens if resolved.profile.limits is not None else None
+                )
+
+                estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(request))
+                context_stats: dict[str, Any] = {
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "estimate_kind": "bytes_per_token_4",
+                    "context_limit_tokens": context_limit_tokens,
+                }
+                if isinstance(context_limit_tokens, int) and context_limit_tokens > 0:
+                    context_stats["estimated_context_left_percent"] = compute_context_left_percent(
+                        used_tokens=estimated_input_tokens,
+                        context_limit_tokens=context_limit_tokens,
+                    )
+
+                cm = settings_for_profile(resolved.profile)
+                threshold_ratio = cm.auto_compact_threshold_ratio
+                if (
+                    guard_id
+                    and guard_id not in self._auto_compact_seen_turn_ids
+                    and should_auto_compact(
+                        estimated_input_tokens=estimated_input_tokens,
+                        context_limit_tokens=context_limit_tokens,
+                        threshold_ratio=threshold_ratio,
+                    )
+                ):
+                    self._auto_compact_seen_turn_ids.add(guard_id)
+                    ok = self._perform_compaction(
+                        trigger="auto",
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        timeout_s=timeout_s,
+                        cancel=cancel,
+                        context_stats=context_stats,
+                        threshold_ratio=threshold_ratio,
+                    )
+                    if not ok:
+                        return
+                    continue
+
+                break
 
             context_ref = self._write_context_ref(request)
             effective_timeout_s = timeout_s if timeout_s is not None else resolved.profile.timeout_s
@@ -439,6 +521,7 @@ class Orchestrator:
                 response, planned_calls = self._run_llm_stream(
                     request=request,
                     context_ref=context_ref.to_dict(),
+                    context_stats=context_stats,
                     profile_id=resolved.profile.profile_id,
                     request_id=request_id,
                     turn_id=turn_id,
@@ -450,6 +533,7 @@ class Orchestrator:
                 response, planned_calls = self._run_llm_complete(
                     request=request,
                     context_ref=context_ref.to_dict(),
+                    context_stats=context_stats,
                     profile_id=resolved.profile.profile_id,
                     request_id=request_id,
                     turn_id=turn_id,
@@ -532,8 +616,285 @@ class Orchestrator:
         )
 
         base_system = self.system_prompt or DEFAULT_SYSTEM_PROMPT
-        system = f"{base_system}\n\n{surface}"
+        parts = [base_system]
+        if isinstance(self.memory_summary, str) and self.memory_summary.strip():
+            parts.append("Session memory summary:\n\n" + self.memory_summary.strip())
+        parts.append(surface)
+        system = "\n\n".join(parts)
         return CanonicalRequest(system=system, messages=list(self._history or []), tools=tools)
+
+    def apply_memory_summary_retention(self) -> None:
+        """
+        Best-effort pruning of loaded history when resuming a session that already has a memory summary.
+
+        This keeps event logs append-only while ensuring resumed prompts do not re-send the full transcript.
+        """
+
+        if self._history is None:
+            self._history = []
+        if not (isinstance(self.memory_summary, str) and self.memory_summary.strip()):
+            return
+        profile = self.model_config.get_profile_for_role(ModelRole.MAIN)
+        if profile is None:
+            return
+        cm = settings_for_profile(profile)
+        context_limit_tokens = resolve_context_limit_tokens(
+            profile.limits.context_limit_tokens if profile.limits is not None else None
+        )
+        retained = apply_compaction_retention(
+            history=list(self._history),
+            memory_summary=self.memory_summary.strip(),
+            context_limit_tokens=context_limit_tokens,
+            history_budget_ratio=cm.history_budget_ratio,
+            history_budget_fallback_tokens=cm.history_budget_fallback_tokens,
+        )
+        self.memory_summary = retained.memory_summary
+        self._history = list(retained.retained_history)
+
+    def _perform_compaction(
+        self,
+        *,
+        trigger: str,
+        request_id: str,
+        turn_id: str | None,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+        context_stats: dict[str, Any] | None = None,
+        threshold_ratio: float | None = None,
+    ) -> bool:
+        cancel = cancel or CancellationToken()
+        if self._history is None:
+            self._history = []
+
+        is_auto = trigger == "auto"
+        has_summary = isinstance(self.memory_summary, str) and self.memory_summary.strip()
+        if not self._history and not has_summary:
+            self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": "Nothing to compact (empty history).",
+                    "error_code": ErrorCode.BAD_REQUEST.value,
+                    "type": "compact_empty",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+            )
+            return False
+
+        profile = self.model_config.get_profile_for_role(ModelRole.MAIN)
+        if profile is None:
+            self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": "No active chat model configured.",
+                    "error_code": ErrorCode.MODEL_RESOLUTION.value,
+                    "type": "compact_no_model",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+            )
+            return False
+
+        step_id = new_id("step")
+        self._emit(
+            kind=EventKind.OPERATION_STARTED,
+            payload={"op_kind": OpKind.COMPACT.value, "trigger": trigger},
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+
+        cm = settings_for_profile(profile)
+        prompt_text = load_compact_prompt_text()
+        compact_request = build_compaction_request(
+            history=list(self._history),
+            memory_summary=self.memory_summary if has_summary else None,
+            prompt_text=prompt_text,
+            tool_output_budget_tokens=cm.tool_output_budget_tokens,
+        )
+
+        extra: dict[str, Any] = {}
+        if isinstance(context_stats, dict):
+            extra["pre_context_stats"] = dict(context_stats)
+        if is_auto and threshold_ratio is not None:
+            extra["threshold_ratio"] = float(threshold_ratio)
+        self._emit(
+            kind=EventKind.OPERATION_PROGRESS,
+            payload={
+                "op_kind": OpKind.COMPACT.value,
+                "status": "running",
+                "trigger": trigger,
+                "message": "Compacting…",
+                "details": extra,
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+
+        trace = LLMTrace.maybe_create(
+            project_root=self.project_root,
+            session_id=self.session_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+        if trace is not None:
+            trace.record_meta(profile_id=profile.profile_id, operation="compact")
+        effective_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+
+        try:
+            response = self.llm_client.complete(
+                role=ModelRole.MAIN,
+                requirements=ModelRequirements(needs_streaming=False, needs_tools=False),
+                request=compact_request,
+                timeout_s=effective_timeout_s,
+                cancel=cancel,
+                trace=trace,
+            )
+        except LLMRequestError as e:
+            if trace is not None:
+                if e.code is ErrorCode.CANCELLED:
+                    trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
+                else:
+                    trace.record_error(e, code=e.code.value if e.code is not None else None)
+            if e.code is ErrorCode.CANCELLED:
+                self._emit(
+                    kind=EventKind.OPERATION_CANCELLED,
+                    payload={
+                        "op_kind": OpKind.COMPACT.value,
+                        "error_code": ErrorCode.CANCELLED.value,
+                        "reason": "cancelled",
+                        "phase": "compact",
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                return False
+            self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": str(e),
+                    "error_code": e.code.value,
+                    "type": "compact_llm_request",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            return False
+
+        summary_text = response.text or ""
+        if not summary_text.strip():
+            self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": "Compaction produced empty summary.",
+                    "error_code": ErrorCode.RESPONSE_VALIDATION.value,
+                    "type": "compact_empty_summary",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            return False
+
+        usage = response.usage.__dict__ if response.usage is not None else None
+        raw_summary_ref = self.artifact_store.put(
+            summary_text,
+            kind="chat_compact_summary_raw",
+            meta={"summary": _summarize_text(summary_text)},
+        )
+
+        context_limit_tokens = resolve_context_limit_tokens(
+            profile.limits.context_limit_tokens if profile.limits is not None else None
+        )
+
+        before_count = len(self._history)
+        retained = apply_compaction_retention(
+            history=list(self._history),
+            memory_summary=summary_text.strip(),
+            context_limit_tokens=context_limit_tokens,
+            history_budget_ratio=cm.history_budget_ratio,
+            history_budget_fallback_tokens=cm.history_budget_fallback_tokens,
+        )
+        used_summary = retained.memory_summary
+        used_summary_ref = self.artifact_store.put(
+            used_summary,
+            kind="chat_memory_summary",
+            meta={"summary": _summarize_text(used_summary)},
+        )
+        self.memory_summary = used_summary
+        self._history = list(retained.retained_history)
+
+        snapshot_ref = self.artifact_store.put(
+            json.dumps(
+                {
+                    "trigger": trigger,
+                    "raw_summary_ref": raw_summary_ref.to_dict(),
+                    "memory_summary_ref": used_summary_ref.to_dict(),
+                    "summary_truncated": used_summary.strip() != summary_text.strip(),
+                    "history_before_count": before_count,
+                    "history_after_count": len(self._history),
+                    "history_budget_tokens": retained.history_budget_tokens,
+                    "summary_estimated_tokens": retained.summary_estimated_tokens,
+                    "usage": usage,
+                },
+                ensure_ascii=False,
+            ),
+            kind="chat_compact_snapshot",
+            meta={"summary": "Compaction snapshot"},
+        )
+
+        try:
+            patch: dict[str, Any] = {
+                "memory_summary": self.memory_summary,
+                "memory_summary_ref": used_summary_ref.to_dict(),
+                "last_compact_at": now_ts_ms(),
+            }
+            if isinstance(usage, dict):
+                patch["last_compaction_usage"] = usage
+            self.session_store.update_session(self.session_id, patch)
+        except Exception:
+            pass
+
+        post_request = self._build_request()
+        post_estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(post_request))
+        post_stats: dict[str, Any] = {
+            "estimated_input_tokens": post_estimated_input_tokens,
+            "estimate_kind": "bytes_per_token_4",
+            "context_limit_tokens": context_limit_tokens,
+        }
+        if isinstance(context_limit_tokens, int) and context_limit_tokens > 0:
+            post_stats["estimated_context_left_percent"] = compute_context_left_percent(
+                used_tokens=post_estimated_input_tokens,
+                context_limit_tokens=context_limit_tokens,
+            )
+
+        self._emit(
+            kind=EventKind.OPERATION_COMPLETED,
+            payload={
+                "op_kind": OpKind.COMPACT.value,
+                "trigger": trigger,
+                "raw_summary_ref": raw_summary_ref.to_dict(),
+                "summary_ref": used_summary_ref.to_dict(),
+                "snapshot_ref": snapshot_ref.to_dict(),
+                "history_before_count": before_count,
+                "history_after_count": len(self._history),
+                "history_budget_tokens": retained.history_budget_tokens,
+                "summary_estimated_tokens": retained.summary_estimated_tokens,
+                "context_stats": post_stats,
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+        return True
 
     def _write_context_ref(self, request: CanonicalRequest) -> "ArtifactRef":
         payload = _canonical_request_to_redacted_dict(request)
@@ -548,6 +909,7 @@ class Orchestrator:
         *,
         request: CanonicalRequest,
         context_ref: dict[str, Any],
+        context_stats: dict[str, Any] | None,
         profile_id: str,
         request_id: str,
         turn_id: str | None,
@@ -573,6 +935,7 @@ class Orchestrator:
                 "context_ref": context_ref,
                 "profile_id": profile_id,
                 "timeout_s": timeout_s,
+                "context_stats": dict(context_stats or {}),
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -737,6 +1100,7 @@ class Orchestrator:
                 return self._run_llm_complete(
                     request=request,
                     context_ref=context_ref,
+                    context_stats=context_stats,
                     profile_id=profile_id,
                     request_id=request_id,
                     turn_id=turn_id,
@@ -855,6 +1219,20 @@ class Orchestrator:
                 return None, []
 
         usage = final_response.usage.__dict__ if final_response.usage is not None else None
+        merged_stats: dict[str, Any] = dict(context_stats or {})
+        used_tokens = None
+        if isinstance(usage, dict) and isinstance(usage.get("input_tokens"), int):
+            used_tokens = int(usage["input_tokens"])
+            merged_stats["input_tokens"] = used_tokens
+            merged_stats["usage_source"] = "provider"
+        elif isinstance(merged_stats.get("estimated_input_tokens"), int):
+            used_tokens = int(merged_stats["estimated_input_tokens"])
+            merged_stats["usage_source"] = "estimate"
+        if isinstance(merged_stats.get("context_limit_tokens"), int) and isinstance(used_tokens, int):
+            merged_stats["context_left_percent"] = compute_context_left_percent(
+                used_tokens=used_tokens,
+                context_limit_tokens=int(merged_stats["context_limit_tokens"]),
+            )
         assistant_text = final_response.text
         output_ref = self.artifact_store.put(
             assistant_text,
@@ -871,12 +1249,25 @@ class Orchestrator:
                 "output_ref": output_ref.to_dict(),
                 "tool_calls": [_planned_tool_call_descriptor(p) for p in planned_calls],
                 "usage": usage,
+                "context_stats": merged_stats,
                 "stop_reason": final_response.stop_reason,
             },
             request_id=request_id,
             turn_id=turn_id,
             step_id=step_id,
         )
+
+        if isinstance(usage, dict):
+            try:
+                self.session_store.update_session(
+                    self.session_id,
+                    {
+                        "last_usage": usage,
+                        "last_context_stats": merged_stats,
+                    },
+                )
+            except Exception:
+                pass
 
         if trace is not None:
             trace.record_response(final_response)
@@ -887,6 +1278,7 @@ class Orchestrator:
         *,
         request: CanonicalRequest,
         context_ref: dict[str, Any],
+        context_stats: dict[str, Any] | None,
         profile_id: str,
         request_id: str,
         turn_id: str | None,
@@ -912,6 +1304,7 @@ class Orchestrator:
                 "profile_id": profile_id,
                 "timeout_s": timeout_s,
                 "stream": False,
+                "context_stats": dict(context_stats or {}),
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -1011,6 +1404,20 @@ class Orchestrator:
                 return None, []
 
         usage = final_response.usage.__dict__ if final_response.usage is not None else None
+        merged_stats: dict[str, Any] = dict(context_stats or {})
+        used_tokens = None
+        if isinstance(usage, dict) and isinstance(usage.get("input_tokens"), int):
+            used_tokens = int(usage["input_tokens"])
+            merged_stats["input_tokens"] = used_tokens
+            merged_stats["usage_source"] = "provider"
+        elif isinstance(merged_stats.get("estimated_input_tokens"), int):
+            used_tokens = int(merged_stats["estimated_input_tokens"])
+            merged_stats["usage_source"] = "estimate"
+        if isinstance(merged_stats.get("context_limit_tokens"), int) and isinstance(used_tokens, int):
+            merged_stats["context_left_percent"] = compute_context_left_percent(
+                used_tokens=used_tokens,
+                context_limit_tokens=int(merged_stats["context_limit_tokens"]),
+            )
         output_ref = self.artifact_store.put(
             assistant_text,
             kind="chat_assistant",
@@ -1025,6 +1432,7 @@ class Orchestrator:
                 "output_ref": output_ref.to_dict(),
                 "tool_calls": [_planned_tool_call_descriptor(p) for p in planned_calls],
                 "usage": usage,
+                "context_stats": merged_stats,
                 "stop_reason": final_response.stop_reason,
                 "stream": False,
             },
@@ -1032,6 +1440,18 @@ class Orchestrator:
             turn_id=turn_id,
             step_id=step_id,
         )
+
+        if isinstance(usage, dict):
+            try:
+                self.session_store.update_session(
+                    self.session_id,
+                    {
+                        "last_usage": usage,
+                        "last_context_stats": merged_stats,
+                    },
+                )
+            except Exception:
+                pass
 
         if trace is not None:
             trace.record_response(final_response)

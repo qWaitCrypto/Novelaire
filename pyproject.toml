@@ -24,4 +24,4 @@ novelaire = "novelaire.cli:main"
 include = ["novelaire*"]
 
 [tool.setuptools.package-data]
-novelaire = ["builtin/skills/**/*"]
+novelaire = ["builtin/skills/**/*", "runtime/prompts/*.md"]
