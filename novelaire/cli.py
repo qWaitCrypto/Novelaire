@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
@@ -27,6 +28,184 @@ EXIT_DENIED = 2
 EXIT_VALIDATION_FAILED = 3
 EXIT_TOOL_FAILED = 4
 EXIT_CONFIG_ERROR = 5
+
+
+def _pick_from_list_standalone(
+    *,
+    title: str,
+    items: list[object],
+    current_index: int = 0,
+    view_height: int = 10,
+    render_item,
+) -> int | None:
+    """
+    Standalone in-place selector for early CLI flows (before ConsoleUI/prompt_toolkit).
+
+    - Uses raw keyboard input (↑/↓, Enter=choose, Esc=cancel).
+    - Returns selected index, or None if cancelled/unavailable.
+    """
+
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return None
+    except Exception:
+        return None
+    if not items:
+        return None
+
+    try:
+        selected_index = int(current_index)
+    except Exception:
+        selected_index = 0
+    if selected_index < 0 or selected_index >= len(items):
+        selected_index = 0
+
+    def _clamp(n: int, lo: int, hi: int) -> int:
+        return lo if n < lo else hi if n > hi else n
+
+    def _read_key(fd: int) -> str:
+        import os
+
+        try:
+            data = os.read(fd, 32)
+        except Exception:
+            return ""
+        try:
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _move_up(n: int) -> None:
+        if n <= 0:
+            return
+        sys.stdout.write(f"\x1b[{n}A")
+
+    def _print_lines(lines: list[str]) -> None:
+        for line in lines:
+            sys.stdout.write("\r" + line + "\r\n")
+
+    def _rewrite_block(prev_lines: int, new_lines: list[str]) -> None:
+        if prev_lines:
+            _move_up(prev_lines)
+            sys.stdout.write("\r")
+            for i in range(prev_lines):
+                sys.stdout.write("\x1b[2K")
+                sys.stdout.write("\r\n" if i != prev_lines - 1 else "")
+            sys.stdout.write("\r")
+            _move_up(prev_lines - 1)
+        _print_lines(new_lines)
+
+    def _clear_block(lines: int) -> None:
+        if lines <= 0:
+            return
+        _move_up(lines)
+        sys.stdout.write("\r")
+        for i in range(lines):
+            sys.stdout.write("\x1b[2K")
+            sys.stdout.write("\r\n" if i != lines - 1 else "")
+        sys.stdout.write("\r")
+        _move_up(lines - 1)
+
+    try:
+        import termios  # type: ignore
+        import tty  # type: ignore
+    except Exception:
+        return None
+
+    fd = None
+    old = None
+    try:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+    except Exception:
+        return None
+
+    rendered_lines: list[str] = []
+    try:
+        while True:
+            height = max(1, int(view_height))
+            top = _clamp(selected_index - (height // 2), 0, max(0, len(items) - height))
+            end_index = min(len(items), top + height)
+            lines: list[str] = [title]
+            if top > 0:
+                lines.append("  ...")
+            for i in range(top, end_index):
+                cursor = "›" if i == selected_index else " "
+                rendered = str(render_item(i, items[i]))
+                line = f"{cursor} {rendered}"
+                if i == selected_index:
+                    line = "\x1b[7m" + line + "\x1b[0m"
+                lines.append(line)
+            if end_index < len(items):
+                lines.append("  ...")
+
+            _rewrite_block(len(rendered_lines), lines)
+            sys.stdout.flush()
+            rendered_lines = lines
+
+            key = _read_key(fd)
+            if key in {"\r", "\n"}:
+                return selected_index
+            if key in {"\x1b", "q", "Q", "\x03"}:  # Esc / q / Ctrl+C
+                return None
+            if key in {"\x1b[A", "k", "K", "\x10"}:  # up / Ctrl+P
+                selected_index = (selected_index - 1) % len(items)
+                continue
+            if key in {"\x1b[B", "j", "J", "\x0e"}:  # down / Ctrl+N
+                selected_index = (selected_index + 1) % len(items)
+                continue
+            if key in {"\x1b[D"}:  # left
+                selected_index = (selected_index - 1) % len(items)
+                continue
+            if key in {"\x1b[C"}:  # right
+                selected_index = (selected_index + 1) % len(items)
+                continue
+    finally:
+        try:
+            if fd is not None and old is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+        try:
+            if rendered_lines:
+                _clear_block(len(rendered_lines))
+                sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _pick_session_id_standalone(*, session_store: FileSessionStore, project_ref: str) -> str | None:
+    sessions = session_store.list_sessions(filters={"project_ref": project_ref, "mode": "chat"})
+    if not sessions:
+        return None
+
+    def _render(_i: int, meta: object) -> str:
+        if not isinstance(meta, dict):
+            return str(meta)
+        sid = str(meta.get("session_id") or "").strip()
+        updated = meta.get("updated_at")
+        profile = meta.get("chat_profile_id")
+        extra = []
+        if profile:
+            extra.append(f"model={profile}")
+        if isinstance(updated, int):
+            extra.append(f"updated_at={updated}")
+        suffix = ("  " + " ".join(extra)) if extra else ""
+        return f"{sid}{suffix}"
+
+    idx = _pick_from_list_standalone(
+        title="Resume session (↑/↓, Enter=resume, Esc=cancel):",
+        items=list(sessions[:20]),
+        current_index=0,
+        view_height=10,
+        render_item=_render,
+    )
+    if idx is None:
+        return None
+    chosen = sessions[:20][idx]
+    sid = chosen.get("session_id") if isinstance(chosen, dict) else None
+    return sid if isinstance(sid, str) and sid.strip() else None
 
 
 def _configure_text_io() -> None:
@@ -91,6 +270,12 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="session_id",
         default=None,
         help="Resume an existing session by ID.",
+    )
+    chat_parser.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help="Interactively pick a recent session to resume.",
     )
     chat_parser.add_argument(
         "--timeout",
@@ -212,16 +397,32 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     # Default: require approval only for high-risk operations (shell commands).
     default_approval_mode = ToolApprovalMode.STANDARD
     session_id = args.session_id
+    resumed = False
     if session_id is None:
-        session_id = session_store.create_session(
-            {
-                "project_ref": str(paths.project_root),
-                "mode": "chat",
-                "tool_approval_mode": default_approval_mode.value,
-            }
-        )
-        session_meta = session_store.get_session(session_id)
+        if getattr(args, "resume", False):
+            picked = _pick_session_id_standalone(
+                session_store=session_store,
+                project_ref=str(paths.project_root),
+            )
+            if picked:
+                session_id = picked
+                resumed = True
+                try:
+                    session_meta = session_store.get_session(session_id)
+                except FileNotFoundError as e:
+                    print(str(e), file=sys.stderr)
+                    return EXIT_CONFIG_ERROR
+        if session_id is None:
+            session_id = session_store.create_session(
+                {
+                    "project_ref": str(paths.project_root),
+                    "mode": "chat",
+                    "tool_approval_mode": default_approval_mode.value,
+                }
+            )
+            session_meta = session_store.get_session(session_id)
     else:
+        resumed = True
         try:
             session_meta = session_store.get_session(session_id)
         except FileNotFoundError as e:
@@ -231,13 +432,16 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     # Apply any session-level chat model selection.
     chat_profile_id = session_meta.get("chat_profile_id")
     if isinstance(chat_profile_id, str) and chat_profile_id.strip():
-        layers.session_config = ModelConfig(role_pointers={ModelRole.MAIN: chat_profile_id.strip()})
+        layers = replace(
+            layers,
+            session_config=ModelConfig(role_pointers={ModelRole.MAIN: chat_profile_id.strip()}),
+        )
 
     try:
         model_config = layers.merged()
     except Exception as e:
         # If the session stored an invalid profile id, fall back to config defaults.
-        layers.session_config = None
+        layers = replace(layers, session_config=None)
         try:
             model_config = layers.merged()
         except Exception:
@@ -286,7 +490,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         event_log_store=event_log_store,
         artifact_store=artifact_store,
         timeout_s=args.timeout_s,
-        print_replay=bool(args.session_id is not None),
+        print_replay=resumed,
     )
 
 
@@ -457,6 +661,205 @@ def _run_chat_console_ui(
         if prompt_session is not None:
             return prompt_session.prompt(text)
         return input(text)
+
+    def _pick_from_list_interactive(
+        *,
+        title: str,
+        items: list[object],
+        current_index: int = 0,
+        view_height: int = 8,
+        render_item,
+    ) -> int | None:
+        """
+        Lightweight in-place selector (no full-screen TUI).
+
+        - Uses raw keyboard input (↑/↓, Enter=choose, Esc=cancel).
+        - Renders a small list "dropdown" under the current prompt line.
+        - Returns the selected index, or None if cancelled/unavailable.
+        """
+
+        if prompt_session is None:
+            return None
+        try:
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                return None
+        except Exception:
+            return None
+        if not items:
+            return None
+
+        try:
+            selected_index = int(current_index)
+        except Exception:
+            selected_index = 0
+        if selected_index < 0 or selected_index >= len(items):
+            selected_index = 0
+
+        is_ansi = True
+        try:
+            is_ansi = bool(sys.stdout.isatty())
+        except Exception:
+            is_ansi = True
+
+        def _clamp(n: int, lo: int, hi: int) -> int:
+            return lo if n < lo else hi if n > hi else n
+
+        def _read_key(fd: int) -> str:
+            import os
+
+            try:
+                data = os.read(fd, 32)
+            except Exception:
+                return ""
+            try:
+                return data.decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+
+        def _move_up(n: int) -> None:
+            if n <= 0:
+                return
+            sys.stdout.write(f"\x1b[{n}A")
+
+        def _print_lines(lines: list[str]) -> None:
+            for line in lines:
+                sys.stdout.write("\r" + line + "\r\n")
+
+        def _rewrite_block(prev_lines: int, new_lines: list[str]) -> None:
+            if prev_lines:
+                _move_up(prev_lines)
+                sys.stdout.write("\r")
+                for i in range(prev_lines):
+                    sys.stdout.write("\x1b[2K")
+                    sys.stdout.write("\r\n" if i != prev_lines - 1 else "")
+                sys.stdout.write("\r")
+                _move_up(prev_lines - 1)
+            _print_lines(new_lines)
+
+        def _clear_block(lines: int) -> None:
+            if lines <= 0:
+                return
+            _move_up(lines)
+            sys.stdout.write("\r")
+            for i in range(lines):
+                sys.stdout.write("\x1b[2K")
+                sys.stdout.write("\r\n" if i != lines - 1 else "")
+            sys.stdout.write("\r")
+            _move_up(lines - 1)
+
+        # Ensure the renderer thread is paused and the prompt line is clean.
+        with ui.suspend():
+            try:
+                import termios  # type: ignore
+                import tty  # type: ignore
+
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                tty.setraw(fd)
+            except Exception:
+                return None
+
+            rendered_lines: list[str] = []
+            try:
+                while True:
+                    height = max(1, int(view_height))
+                    top = _clamp(
+                        selected_index - (height // 2),
+                        0,
+                        max(0, len(items) - height),
+                    )
+                    end_index = min(len(items), top + height)
+                    lines: list[str] = [title]
+                    if top > 0:
+                        lines.append("  ...")
+                    for i in range(top, end_index):
+                        cursor = "›" if i == selected_index else " "
+                        rendered = str(render_item(i, items[i]))
+                        line = f"{cursor} {rendered}"
+                        if i == selected_index and is_ansi:
+                            line = "\x1b[7m" + line + "\x1b[0m"
+                        lines.append(line)
+                    if end_index < len(items):
+                        lines.append("  ...")
+
+                    _rewrite_block(len(rendered_lines), lines)
+                    sys.stdout.flush()
+                    rendered_lines = lines
+
+                    key = _read_key(fd)
+                    if key in {"\r", "\n"}:
+                        return selected_index
+                    if key in {"\x1b", "q", "Q"}:
+                        return None
+                    if key in {"\x03"}:  # Ctrl+C
+                        return None
+
+                    if key in {"\x1b[A", "k", "K", "\x10"}:  # up / Ctrl+P
+                        selected_index = (selected_index - 1) % len(items)
+                        continue
+                    if key in {"\x1b[B", "j", "J", "\x0e"}:  # down / Ctrl+N
+                        selected_index = (selected_index + 1) % len(items)
+                        continue
+                    if key in {"\x1b[D"}:  # left
+                        selected_index = (selected_index - 1) % len(items)
+                        continue
+                    if key in {"\x1b[C"}:  # right
+                        selected_index = (selected_index + 1) % len(items)
+                        continue
+            finally:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    pass
+                try:
+                    if rendered_lines:
+                        _clear_block(len(rendered_lines))
+                        sys.stdout.flush()
+                except Exception:
+                    pass
+
+    def _pick_model_profile_interactive(*, cfg, current_profile_id: str | None) -> str | None:
+        profile_ids = sorted(cfg.profiles.keys())
+        if not profile_ids:
+            return None
+
+        try:
+            current_index = profile_ids.index(current_profile_id) if current_profile_id in cfg.profiles else 0
+        except Exception:
+            current_index = 0
+
+        selected = _pick_from_list_interactive(
+            title="Select chat model (↑/↓, Enter=choose, Esc=cancel):",
+            items=list(profile_ids),
+            current_index=current_index,
+            view_height=8,
+            render_item=lambda _i, pid: f"{'*' if pid == current_profile_id else ' '} {pid}  {cfg.profiles[pid].provider_kind.value} {cfg.profiles[pid].model_name}",
+        )
+        if selected is None:
+            return None
+        return profile_ids[int(selected)]
+
+    def _pick_perm_mode_interactive(*, current_mode: str) -> str | None:
+        modes: list[tuple[str, str]] = [
+            ("strict", "approval required for every tool call"),
+            ("standard", "approval required only for shell commands"),
+            ("trusted", "no approvals (dangerous)"),
+        ]
+        idx = 0
+        for i, (m, _) in enumerate(modes):
+            if m == current_mode:
+                idx = i
+                break
+        selected = _pick_from_list_interactive(
+            title="Select tool approval mode (↑/↓, Enter=choose, Esc=cancel):",
+            items=list(modes),
+            current_index=idx,
+            view_height=6,
+            render_item=lambda _i, item: f"{'*' if item[0] == current_mode else ' '} {item[0]}  {item[1]}",
+        )
+        if selected is None:
+            return None
+        return modes[int(selected)][0]
 
     def _handle_pending_approvals_ui(*, request_id: str | None) -> None:
         def _prompt_decision(text: str) -> str:
@@ -638,7 +1041,16 @@ def _run_chat_console_ui(
             parts = cmd.split()
             cfg = orchestrator.model_config
             current_profile_id = cfg.role_pointers.get(ModelRole.MAIN)
-            if len(parts) == 1 or parts[1] in {"list", "ls"}:
+            if len(parts) == 1:
+                picked = _pick_model_profile_interactive(cfg=cfg, current_profile_id=current_profile_id)
+                if not picked:
+                    if not cfg.profiles:
+                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "No model profiles configured."}))
+                    else:
+                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model <profile-id>"}))
+                    continue
+                target = picked
+            elif parts[1] in {"list", "ls"}:
                 current_desc = "(unset)"
                 if isinstance(current_profile_id, str) and current_profile_id in cfg.profiles:
                     p = cfg.profiles[current_profile_id]
@@ -653,33 +1065,42 @@ def _run_chat_console_ui(
                     mark = "*" if pid == current_profile_id else " "
                     lines.append(f"  {mark} {pid}: {p.provider_kind.value} {p.model_name}")
                 ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "\n".join(lines)}))
-                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Usage: /model set <profile-id>"}))
+                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Usage: /model <profile-id>"}))
                 continue
-            if len(parts) >= 3 and parts[1] in {"set", "use"}:
-                target = parts[2].strip()
+            elif len(parts) >= 2 and parts[1] in {"set", "use"}:
+                target = parts[2].strip() if len(parts) >= 3 else ""
                 if not target:
-                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model set <profile-id>"}))
+                    picked = _pick_model_profile_interactive(cfg=cfg, current_profile_id=current_profile_id)
+                    if not picked:
+                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model <profile-id>"}))
+                        continue
+                    target = picked
+            else:
+                target = parts[1].strip()
+                if not target:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model <profile-id>"}))
                     continue
-                if target not in cfg.profiles:
-                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Unknown model profile: {target}"}))
-                    continue
-                try:
-                    orchestrator.set_chat_model_profile(target)
-                except Exception as e:
-                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Failed to switch model: {e}"}))
-                    continue
-                try:
-                    orchestrator.session_store.update_session(orchestrator.session_id, {"chat_profile_id": target})
-                except Exception:
-                    pass
-                p = cfg.profiles[target]
-                ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Chat model set to: {target} ({p.provider_kind.value} {p.model_name})"}))
-                if orchestrator.tools_enabled:
-                    caps = p.capabilities.with_provider_defaults(p.provider_kind)
-                    if caps.supports_tools is not True:
-                        ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Selected model does not declare tool support; tool calls may fail."}))
+
+            if target not in cfg.profiles:
+                ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Unknown model profile: {target}"}))
                 continue
-            ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model set <profile-id>"}))
+            try:
+                orchestrator.set_chat_model_profile(target)
+            except Exception as e:
+                ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Failed to switch model: {e}"}))
+                continue
+            try:
+                orchestrator.session_store.update_session(orchestrator.session_id, {"chat_profile_id": target})
+            except Exception:
+                pass
+            p = cfg.profiles[target]
+            ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Chat model set to: {target} ({p.provider_kind.value} {p.model_name})"}))
+            if orchestrator.tools_enabled:
+                caps = p.capabilities.with_provider_defaults(p.provider_kind)
+                if caps.supports_tools is not True:
+                    ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Selected model does not declare tool support; tool calls may fail."}))
+            continue
+            ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model <profile-id>"}))
             continue
         if cmd.startswith("/perm"):
             parts = cmd.split()
@@ -688,6 +1109,12 @@ def _run_chat_console_ui(
                 ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Tool runtime not available."}))
                 continue
             if len(parts) == 1:
+                mode = tr.get_approval_mode().value
+                picked = _pick_perm_mode_interactive(current_mode=mode)
+                if not picked:
+                    continue
+                raw = picked
+            elif parts[1] in {"list", "ls"}:
                 mode = tr.get_approval_mode().value
                 ui.emit(
                     UIEvent(
@@ -705,8 +1132,9 @@ def _run_chat_console_ui(
                     )
                 )
                 continue
+            else:
+                raw = parts[1].strip().lower()
 
-            raw = parts[1].strip().lower()
             desired: ToolApprovalMode | None = None
             if raw in {"strict", "all", "always", "ask_all", "paranoid"}:
                 desired = ToolApprovalMode.STRICT
