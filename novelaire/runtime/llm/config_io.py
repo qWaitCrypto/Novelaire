@@ -17,6 +17,7 @@ from .types import (
 )
 
 ENV_FILENAME = "env"
+MODELS_FILENAME = "models.json"
 
 def default_global_models_path() -> Path:
     override = os.environ.get("NOVELAIRE_GLOBAL_MODELS_PATH")
@@ -81,6 +82,178 @@ def save_model_config_file(path: Path, config: ModelConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = model_config_to_dict(config)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_model_registry_file(path: Path) -> tuple[ModelConfig, str | None]:
+    """
+    Load a hierarchical models.json (registry format) and return (ModelConfig, default_profile_id).
+
+    Registry schema:
+      - default_profile (optional)
+      - profiles: { "<profile-id>": { provider_kind, base_url, model, api_key?, timeout_s?, max_tokens?, ... } }
+
+    The returned ModelConfig uses role_pointers ONLY to set the default chat model pointer (ModelRole.MAIN).
+    Users do not configure role pointers directly in models.json.
+    """
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise ModelConfigError(f"Model registry file not found: {path}") from e
+    except OSError as e:
+        raise ModelConfigError(f"Failed to read model registry file: {path} ({e})") from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ModelConfigError(f"Model registry file is not valid JSON: {path} ({e})") from e
+
+    root = _ensure_dict(data, ctx=f"{path}:root")
+    _assert_known_keys(root, allowed={"default_profile", "profiles"}, ctx=f"{path}:root")
+
+    default_profile_raw = root.get("default_profile")
+    default_profile = str(default_profile_raw).strip() if default_profile_raw is not None else None
+    if default_profile == "":
+        default_profile = None
+
+    profiles_raw = root.get("profiles", {})
+    profiles_obj = _ensure_dict(profiles_raw, ctx=f"{path}:profiles")
+    if not profiles_obj:
+        raise ModelConfigError(f"{path}:profiles must not be empty")
+
+    profiles: dict[str, ModelProfile] = {}
+    for profile_id, profile_data in profiles_obj.items():
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ModelConfigError(f"{path}:profiles: profile id must be a non-empty string")
+        profile_id = profile_id.strip()
+        profile_dict = _ensure_dict(profile_data, ctx=f"{path}:profiles.{profile_id}")
+        profiles[profile_id] = _parse_registry_profile(profile_id, profile_dict, source=str(path))
+
+    chosen_default = default_profile
+    if chosen_default is None:
+        if "main" in profiles:
+            chosen_default = "main"
+        else:
+            chosen_default = sorted(profiles.keys())[0]
+
+    if chosen_default not in profiles:
+        raise ModelConfigError(f"{path}: default_profile '{chosen_default}' not found in profiles")
+
+    cfg = ModelConfig(profiles=profiles, role_pointers={ModelRole.MAIN: chosen_default})
+    cfg.validate_consistency()
+    return cfg, chosen_default
+
+
+def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str) -> ModelProfile:
+    _assert_known_keys(
+        profile_dict,
+        allowed={
+            "provider_kind",
+            "base_url",
+            "model",
+            "api_key",
+            "timeout_s",
+            "max_tokens",
+            "default_params",
+            "capabilities",
+        },
+        ctx=f"{source}:profiles.{profile_id}",
+    )
+
+    provider_kind_str = _require_str(profile_dict, "provider_kind", ctx=f"{source}:profiles.{profile_id}")
+    try:
+        provider_kind = ProviderKind(provider_kind_str)
+    except ValueError as e:
+        supported = ", ".join(sorted(k.value for k in ProviderKind))
+        raise ModelConfigError(
+            f"{source}:profiles.{profile_id}: unknown provider_kind '{provider_kind_str}'. Supported: {supported}"
+        ) from e
+
+    # Allow empty base_url in templates; the client will raise an actionable error if a profile
+    # with an empty base_url is selected for use.
+    base_url_val = profile_dict.get("base_url")
+    if not isinstance(base_url_val, str):
+        raise ModelConfigError(f"{source}:profiles.{profile_id}.base_url must be a string")
+    base_url = base_url_val
+    model_name = _require_str(profile_dict, "model", ctx=f"{source}:profiles.{profile_id}")
+
+    api_key_val = profile_dict.get("api_key")
+    api_key = api_key_val if isinstance(api_key_val, str) else None
+    api_key = api_key.strip() if isinstance(api_key, str) else None
+    if api_key:
+        credential_ref = CredentialRef(kind="inline", identifier=api_key)
+    elif provider_kind is ProviderKind.OPENAI_COMPATIBLE:
+        # OpenAI-compatible endpoints are often local/proxied and may not require authentication.
+        # The OpenAI SDK still expects an api_key, so default to a dummy key if none is provided.
+        credential_ref = CredentialRef(kind="inline", identifier="novelaire")
+    else:
+        credential_ref = None
+        if provider_kind is ProviderKind.ANTHROPIC:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=anthropic")
+        if provider_kind is ProviderKind.GEMINI_INTERNAL:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=gemini_internal")
+
+    timeout_s = None
+    if "timeout_s" in profile_dict and profile_dict["timeout_s"] is not None:
+        timeout_s = _maybe_float(profile_dict["timeout_s"], ctx=f"{source}:profiles.{profile_id}.timeout_s")
+        if timeout_s <= 0:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}.timeout_s must be > 0")
+
+    max_tokens = None
+    if "max_tokens" in profile_dict and profile_dict["max_tokens"] is not None:
+        max_tokens = _maybe_int(profile_dict["max_tokens"], ctx=f"{source}:profiles.{profile_id}.max_tokens")
+        if max_tokens <= 0:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}.max_tokens must be > 0")
+
+    default_params: dict[str, Any] = {}
+    if "default_params" in profile_dict and profile_dict["default_params"] is not None:
+        default_params_obj = _ensure_dict(profile_dict["default_params"], ctx=f"{source}:profiles.{profile_id}.default_params")
+        default_params = dict(default_params_obj)
+
+    if max_tokens is not None:
+        default_params.setdefault("max_tokens", max_tokens)
+
+    if provider_kind is ProviderKind.ANTHROPIC and "max_tokens" not in default_params:
+        raise ModelConfigError(f"{source}:profiles.{profile_id}: max_tokens is required for provider_kind=anthropic")
+
+    capabilities = ModelCapabilities(
+        supports_tools=None,
+        supports_structured_output=None,
+        supports_streaming=None,
+    )
+    if "capabilities" in profile_dict and profile_dict["capabilities"] is not None:
+        cap = _ensure_dict(profile_dict["capabilities"], ctx=f"{source}:profiles.{profile_id}.capabilities")
+        _assert_known_keys(
+            cap,
+            allowed={"supports_tools", "supports_structured_output", "supports_streaming"},
+            ctx=f"{source}:profiles.{profile_id}.capabilities",
+        )
+        capabilities = ModelCapabilities(
+            supports_tools=_maybe_bool(
+                cap.get("supports_tools"), ctx=f"{source}:profiles.{profile_id}.capabilities.supports_tools"
+            ),
+            supports_structured_output=_maybe_bool(
+                cap.get("supports_structured_output"),
+                ctx=f"{source}:profiles.{profile_id}.capabilities.supports_structured_output",
+            ),
+            supports_streaming=_maybe_bool(
+                cap.get("supports_streaming"),
+                ctx=f"{source}:profiles.{profile_id}.capabilities.supports_streaming",
+            ),
+        )
+
+    return ModelProfile(
+        profile_id=profile_id,
+        provider_kind=provider_kind,
+        base_url=base_url,
+        model_name=model_name,
+        credential_ref=credential_ref,
+        timeout_s=timeout_s,
+        default_params=default_params,
+        capabilities=capabilities,
+        tags=set(),
+        limits=None,
+    )
 
 def load_model_config_env_file(path: Path) -> ModelConfig:
     try:
@@ -153,7 +326,10 @@ def load_model_config_from_env(env: dict[str, str], *, source: str) -> ModelConf
     try:
         provider_kind = ProviderKind(provider_raw)
     except ValueError as e:
-        raise ModelConfigError(f"{source}: invalid NOVELAIRE_PROVIDER_KIND={provider_raw!r}") from e
+        supported = ", ".join(sorted(k.value for k in ProviderKind))
+        raise ModelConfigError(
+            f"{source}: invalid NOVELAIRE_PROVIDER_KIND={provider_raw!r}. Supported: {supported}"
+        ) from e
 
     base_url = (env.get("NOVELAIRE_BASE_URL") or "").strip()
     if not base_url:
@@ -231,9 +407,15 @@ def load_model_config_layers_for_dir(
 ) -> ModelConfigLayers:
     start_dir = (start_dir or Path.cwd()).resolve()
 
+    # v0.2+: prefer hierarchical models.json; keep env support as a legacy fallback.
     global_cfg = ModelConfig()
-    if global_path is not None and global_path.exists():
-        global_cfg = load_model_config_env_file(global_path)
+    global_models_path = default_global_models_path() if global_path is None else global_path
+    if global_models_path is not None and global_models_path.exists():
+        global_cfg, _ = load_model_registry_file(global_models_path)
+    else:
+        legacy_global_env = default_global_env_path()
+        if legacy_global_env.exists():
+            global_cfg = load_model_config_env_file(legacy_global_env)
 
     project_root = discover_project_root(start_dir)
     if project_root is None:
@@ -244,16 +426,23 @@ def load_model_config_layers_for_dir(
             )
         return ModelConfigLayers(global_config=global_cfg)
 
-    project_path = project_env_path(project_root)
-    if not project_path.exists():
-        if require_project:
-            raise ModelConfigError(
-                f"Missing required project env config file: {project_path}. "
-                "Run 'novelaire init' and edit '.novelaire/config/env'."
-            )
-        return ModelConfigLayers(global_config=global_cfg)
+    project_models = project_models_path(project_root)
+    if project_models.exists():
+        project_cfg, _ = load_model_registry_file(project_models)
+        return ModelConfigLayers(global_config=global_cfg, project_config=project_cfg)
 
-    return ModelConfigLayers(global_config=global_cfg, project_config=load_model_config_env_file(project_path))
+    # Legacy fallback: project env.
+    project_env = project_env_path(project_root)
+    if project_env.exists():
+        return ModelConfigLayers(global_config=global_cfg, project_config=load_model_config_env_file(project_env))
+
+    if require_project:
+        raise ModelConfigError(
+            f"Missing required project model config file: {project_models}. "
+            "Run 'novelaire init' and edit '.novelaire/config/models.json'."
+        )
+
+    return ModelConfigLayers(global_config=global_cfg)
 
 
 def load_model_config_dict(data: Any, *, source: str) -> ModelConfig:
@@ -330,8 +519,9 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
     try:
         provider_kind = ProviderKind(provider_kind_str)
     except ValueError as e:
+        supported = ", ".join(sorted(k.value for k in ProviderKind))
         raise ModelConfigError(
-            f"{source}:profiles.{profile_id}: unknown provider_kind '{provider_kind_str}'"
+            f"{source}:profiles.{profile_id}: unknown provider_kind '{provider_kind_str}'. Supported: {supported}"
         ) from e
 
     base_url = _require_str(profile_dict, "base_url", ctx=f"{source}:profiles.{profile_id}")

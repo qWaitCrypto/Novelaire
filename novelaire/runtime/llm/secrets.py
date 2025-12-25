@@ -16,8 +16,15 @@ def resolve_credential(credential_ref: CredentialRef) -> str:
             )
         return value
 
+    if credential_ref.kind in {"inline", "plaintext"}:
+        if not credential_ref.identifier:
+            raise CredentialResolutionError(
+                "Missing inline credential value.",
+                credential_ref=credential_ref.to_redacted_string(),
+            )
+        return credential_ref.identifier
+
     raise CredentialResolutionError(
         f"Unsupported credential_ref kind '{credential_ref.kind}'.",
         credential_ref=credential_ref.to_redacted_string(),
     )
-

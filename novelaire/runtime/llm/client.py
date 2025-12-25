@@ -22,7 +22,9 @@ from .errors import (
     wrap_provider_exception,
 )
 from .providers.anthropic import AnthropicAdapter
+from .providers.gemini_internal import GeminiInternalAdapter
 from .providers.openai_compatible import OpenAICompatibleAdapter
+from .providers.base import PreparedRequest
 from .router import ModelRouter
 from .secrets import resolve_credential
 from .trace import LLMTrace
@@ -263,6 +265,19 @@ class LLMClient:
     def __init__(self, config: ModelConfig) -> None:
         self._router = ModelRouter(config)
 
+    @staticmethod
+    def _assert_profile_base_url(*, profile: "ModelProfile", operation: str) -> None:
+        if not profile.base_url.strip():
+            raise LLMRequestError(
+                "Model profile base_url is empty. Edit .novelaire/config/models.json and set base_url for the active profile.",
+                code=LLMErrorCode.BAD_REQUEST,
+                provider_kind=profile.provider_kind,
+                profile_id=profile.profile_id,
+                model=profile.model_name,
+                retryable=False,
+                details={"operation": operation, "missing": "base_url"},
+            )
+
     def complete(
         self,
         *,
@@ -279,6 +294,7 @@ class LLMClient:
         effective = _merge_requirements(requirements, request=request, force_streaming=False)
         resolved = self._router.resolve(role=role, requirements=effective)
         profile = resolved.profile
+        self._assert_profile_base_url(profile=profile, operation="complete")
         if trace is not None:
             trace.record_canonical_request(request)
         _raise_if_cancelled(
@@ -360,6 +376,100 @@ class LLMClient:
             if trace is not None:
                 trace.write_json("provider_response.json", resp)
             return _openai_to_response(profile_id=profile.profile_id, resp=resp)
+
+        if profile.provider_kind is ProviderKind.GEMINI_INTERNAL:
+            if profile.credential_ref is None:
+                raise LLMRequestError(
+                    "Missing credentials for gemini_internal profile.",
+                    code=LLMErrorCode.AUTH,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    retryable=False,
+                    details={"operation": "complete", "missing": "credential_ref"},
+                )
+            try:
+                token = resolve_credential(profile.credential_ref)
+            except CredentialResolutionError as e:
+                raise LLMRequestError(
+                    str(e),
+                    code=LLMErrorCode.AUTH,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    retryable=False,
+                    details={"operation": "complete", "credential_ref": getattr(e, "credential_ref", None)},
+                    cause=e,
+                ) from e
+
+            prepared = GeminiInternalAdapter().prepare_request(profile, request)
+            auth_value = token.strip()
+            if not auth_value.lower().startswith("bearer "):
+                auth_value = f"Bearer {auth_value}"
+            prepared = PreparedRequest(
+                method=prepared.method,
+                url=prepared.url,
+                headers={**prepared.headers, "Authorization": auth_value},
+                json=prepared.json,
+            )
+            request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=False,
+                    timeout_s=request_timeout_s,
+                    payload=prepared.redacted().json,
+                )
+            try:
+                import httpx  # type: ignore
+
+                with httpx.Client(timeout=(None if request_timeout_s is None else float(request_timeout_s))) as client:
+                    r = client.request(
+                        prepared.method,
+                        prepared.url,
+                        headers=prepared.headers,
+                        json=prepared.json,
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+            except Exception as e:
+                # Preserve response body for easier debugging (many gateways return useful JSON on 4xx).
+                try:
+                    import httpx  # type: ignore
+
+                    if isinstance(e, httpx.HTTPStatusError):
+                        body = ""
+                        try:
+                            body = e.response.text or ""
+                        except Exception:
+                            body = ""
+                        if trace is not None:
+                            try:
+                                trace.write_json(
+                                    "provider_error_response.json",
+                                    {
+                                        "status_code": int(e.response.status_code),
+                                        "headers": dict(e.response.headers),
+                                        "text": body[:4000],
+                                    },
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                raise _wrap_httpx_like_exception(
+                    e,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    operation="complete",
+                ) from e
+            if trace is not None:
+                trace.write_json("provider_response.json", data)
+            return _gemini_internal_to_response(profile_id=profile.profile_id, data=data)
 
         if profile.provider_kind is ProviderKind.ANTHROPIC:
             _assert_no_reserved_params(
@@ -452,6 +562,7 @@ class LLMClient:
         effective = _merge_requirements(requirements, request=request, force_streaming=True)
         resolved = self._router.resolve(role=role, requirements=effective)
         profile = resolved.profile
+        self._assert_profile_base_url(profile=profile, operation="stream")
         if trace is not None:
             trace.record_canonical_request(request)
         _raise_if_cancelled(
@@ -639,6 +750,9 @@ class LLMClient:
                 wd_stop.set()
                 _maybe_close_stream(raw_stream)
             return
+
+        if profile.provider_kind is ProviderKind.GEMINI_INTERNAL:
+            raise ProviderAdapterError("gemini_internal does not support streaming; use complete().")
 
         if profile.provider_kind is ProviderKind.ANTHROPIC:
             _assert_no_reserved_params(
@@ -858,6 +972,151 @@ def _openai_to_response(*, profile_id: str, resp: Any) -> LLMResponse:
         usage=_openai_to_usage(resp),
         stop_reason=getattr(choice0, "finish_reason", None),
         request_id=getattr(resp, "id", None),
+    )
+
+def _gemini_usage_from_metadata(meta: Any) -> LLMUsage | None:
+    if not isinstance(meta, dict):
+        return None
+    prompt = meta.get("promptTokenCount")
+    candidates = meta.get("candidatesTokenCount")
+    total = meta.get("totalTokenCount")
+    return LLMUsage(
+        input_tokens=prompt if isinstance(prompt, int) else None,
+        output_tokens=candidates if isinstance(candidates, int) else None,
+        total_tokens=total if isinstance(total, int) else None,
+        cache_creation_input_tokens=None,
+        cache_read_input_tokens=None,
+    )
+
+
+def _gemini_internal_to_response(*, profile_id: str, data: Any) -> LLMResponse:
+    if not isinstance(data, dict):
+        raise ProviderAdapterError("gemini_internal response must be a JSON object.")
+
+    root = data.get("response") if isinstance(data.get("response"), dict) else data
+    if not isinstance(root, dict):
+        raise ProviderAdapterError("gemini_internal response wrapper is invalid.")
+
+    candidates = root.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise ProviderAdapterError("gemini_internal response is missing candidates[0].")
+    cand0 = candidates[0]
+    if not isinstance(cand0, dict):
+        raise ProviderAdapterError("gemini_internal candidates[0] must be an object.")
+
+    content = cand0.get("content")
+    parts = None
+    if isinstance(content, dict):
+        parts = content.get("parts")
+    if not isinstance(parts, list):
+        parts = []
+
+    text_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    for idx, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        if "text" in part and isinstance(part.get("text"), str) and part.get("thought") is not True:
+            text_parts.append(part["text"])
+        fc = part.get("functionCall")
+        if isinstance(fc, dict):
+            name = fc.get("name")
+            args = fc.get("args")
+            thought_sig = part.get("thoughtSignature") or part.get("thought_signature")
+            if not isinstance(name, str) or not name:
+                raise ProviderAdapterError("gemini_internal functionCall missing name.")
+            if args is None:
+                parsed_args: dict[str, Any] = {}
+            elif isinstance(args, dict):
+                parsed_args = args
+            else:
+                raise ProviderAdapterError("gemini_internal functionCall.args must be an object.")
+            raw = json.dumps(parsed_args, ensure_ascii=False)
+            tool_calls.append(
+                ToolCall(
+                    tool_call_id=f"gemini_{idx}",
+                    name=name,
+                    arguments=dict(parsed_args),
+                    raw_arguments=raw,
+                    thought_signature=(str(thought_sig) if isinstance(thought_sig, str) and thought_sig else None),
+                )
+            )
+
+    model = root.get("modelVersion")
+    model_str = model if isinstance(model, str) else ""
+    stop = cand0.get("finishReason")
+    stop_str = stop if isinstance(stop, str) else None
+    request_id = root.get("responseId")
+    request_id_str = request_id if isinstance(request_id, str) else None
+
+    usage = _gemini_usage_from_metadata(root.get("usageMetadata"))
+    return LLMResponse(
+        provider_kind=ProviderKind.GEMINI_INTERNAL,
+        profile_id=profile_id,
+        model=model_str,
+        text="".join(text_parts),
+        tool_calls=tool_calls,
+        usage=usage,
+        stop_reason=stop_str,
+        request_id=request_id_str,
+    )
+
+
+def _wrap_httpx_like_exception(
+    exc: BaseException,
+    *,
+    provider_kind: ProviderKind,
+    profile_id: str,
+    model: str | None,
+    operation: str,
+) -> LLMRequestError:
+    try:
+        import httpx  # type: ignore
+
+        if isinstance(exc, httpx.TimeoutException):
+            code = LLMErrorCode.TIMEOUT
+            status_code = None
+        elif isinstance(exc, httpx.NetworkError):
+            code = LLMErrorCode.NETWORK_ERROR
+            status_code = None
+        elif isinstance(exc, httpx.HTTPStatusError):
+            status_code = int(exc.response.status_code)
+            code = LLMErrorCode.UNKNOWN
+            if status_code == 400:
+                code = LLMErrorCode.BAD_REQUEST
+            elif status_code == 401:
+                code = LLMErrorCode.AUTH
+            elif status_code == 403:
+                code = LLMErrorCode.PERMISSION
+            elif status_code == 404:
+                code = LLMErrorCode.NOT_FOUND
+            elif status_code == 409:
+                code = LLMErrorCode.CONFLICT
+            elif status_code == 422:
+                code = LLMErrorCode.UNPROCESSABLE
+            elif status_code == 429:
+                code = LLMErrorCode.RATE_LIMIT
+            elif 500 <= status_code <= 599:
+                code = LLMErrorCode.SERVER_ERROR
+        else:
+            code = LLMErrorCode.UNKNOWN
+            status_code = None
+    except Exception:
+        code = LLMErrorCode.UNKNOWN
+        status_code = None
+
+    retryable = code in {LLMErrorCode.TIMEOUT, LLMErrorCode.RATE_LIMIT, LLMErrorCode.SERVER_ERROR, LLMErrorCode.NETWORK_ERROR}
+    return LLMRequestError(
+        str(exc) or exc.__class__.__name__,
+        code=code,
+        provider_kind=provider_kind,
+        profile_id=profile_id,
+        model=model,
+        status_code=status_code,
+        request_id=None,
+        retryable=retryable,
+        details={"operation": operation},
+        cause=exc,
     )
 
 

@@ -75,6 +75,7 @@ class Orchestrator:
     event_log_store: EventLogStore
     artifact_store: ArtifactStore
     approval_store: ApprovalStore
+    model_config: ModelConfig
     llm_client: LLMClient
     model_router: ModelRouter
     skill_store: SkillStore | None = None
@@ -84,6 +85,7 @@ class Orchestrator:
     spec_proposal_store: SpecProposalStore | None = None
     snapshot_backend: GitSnapshotBackend | None = None
     tools_enabled: bool = False
+    max_tool_turns: int = 30
     tool_registry: ToolRegistry | None = None
     tool_runtime: ToolRuntime | None = None
     system_prompt: str | None = None
@@ -103,8 +105,14 @@ class Orchestrator:
         model_config: ModelConfig,
         system_prompt: str | None = None,
         tools_enabled: bool = False,
+        max_tool_turns: int | None = None,
     ) -> "Orchestrator":
         effective_system_prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
+        effective_max_tool_turns = 30 if max_tool_turns is None else int(max_tool_turns)
+        if effective_max_tool_turns < 1:
+            raise ValueError("max_tool_turns must be >= 1")
+        if effective_max_tool_turns > 256:
+            raise ValueError("max_tool_turns must be <= 256")
         router = ModelRouter(model_config)
         skill_store = SkillStore(project_root=project_root)
         plan_store = PlanStore(session_store=session_store, session_id=session_id)
@@ -136,6 +144,7 @@ class Orchestrator:
             event_log_store=event_log_store,
             artifact_store=artifact_store,
             approval_store=approval_store,
+            model_config=model_config,
             llm_client=LLMClient(model_config),
             model_router=router,
             skill_store=skill_store,
@@ -145,11 +154,30 @@ class Orchestrator:
             spec_proposal_store=spec_proposal_store,
             snapshot_backend=snapshot_backend,
             tools_enabled=tools_enabled,
+            max_tool_turns=effective_max_tool_turns,
             tool_registry=registry,
             tool_runtime=tool_runtime,
             system_prompt=effective_system_prompt,
             _history=[],
         )
+
+    def set_chat_model_profile(self, profile_id: str) -> None:
+        """
+        Switch the active chat model (ModelRole.MAIN) to a different configured profile.
+
+        This updates the router and client for subsequent requests.
+        """
+
+        if profile_id not in self.model_config.profiles:
+            raise ValueError(f"Unknown model profile: {profile_id}")
+        cfg = ModelConfig(
+            profiles=dict(self.model_config.profiles),
+            role_pointers={ModelRole.MAIN: profile_id},
+        )
+        cfg.validate_consistency()
+        self.model_config = cfg
+        self.model_router = ModelRouter(cfg)
+        self.llm_client = LLMClient(cfg)
 
     def load_history_from_events(self) -> None:
         history: list[CanonicalMessage] = []
@@ -349,12 +377,10 @@ class Orchestrator:
         if self.tool_registry is None or self.tool_runtime is None:
             raise RuntimeError("Tool runtime not initialized.")
 
-        max_turns = 8
-        for turn_index in range(max_turns):
+        for turn_index in range(self.max_tool_turns):
             step_id = new_id("step")
             request = self._build_request()
             requirements = ModelRequirements(
-                needs_streaming=True,
                 needs_tools=bool(request.tools),
             )
             try:
@@ -631,12 +657,9 @@ class Orchestrator:
             )
             return None, []
         except LLMRequestError as e:
-            if trace is not None:
-                if e.code is ErrorCode.CANCELLED:
-                    trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
-                else:
-                    trace.record_error(e, code=e.code.value if e.code is not None else None)
             if e.code is ErrorCode.CANCELLED:
+                if trace is not None:
+                    trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
                 self._emit(
                     kind=EventKind.LLM_REQUEST_FAILED,
                     payload={
@@ -666,6 +689,64 @@ class Orchestrator:
                     step_id=step_id,
                 )
                 return None, []
+
+            # Best-effort fallback: some OpenAI-compatible gateways claim streaming support
+            # but frequently terminate the TLS connection (e.g. SSLEOFError) before the first chunk.
+            # If we haven't emitted any output yet, retry once using non-streaming complete().
+            if (
+                e.code is ErrorCode.NETWORK_ERROR
+                and not streamed_parts
+                and not delta_buf
+            ):
+                if trace is not None:
+                    trace.write_json(
+                        "stream_error.json",
+                        {
+                            "type": type(e).__name__,
+                            "message": str(e),
+                            "code": e.code.value if e.code is not None else None,
+                            "details": e.details,
+                        },
+                    )
+                    trace.record_meta(stream_fallback=True, stream_error_code=e.code.value)
+
+                self._emit(
+                    kind=EventKind.LLM_REQUEST_FAILED,
+                    payload={
+                        "error": str(e),
+                        "error_code": e.code.value,
+                        "code": e.code.value if e.code is not None else None,
+                        "provider_kind": e.provider_kind.value if e.provider_kind is not None else None,
+                        "profile_id": e.profile_id,
+                        "model": e.model,
+                        "retryable": e.retryable,
+                        "details": e.details,
+                        "handled": "fallback_to_complete",
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                self._emit(
+                    kind=EventKind.OPERATION_PROGRESS,
+                    payload={"message": "Streaming failed; retrying without streaming."},
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                return self._run_llm_complete(
+                    request=request,
+                    context_ref=context_ref,
+                    profile_id=profile_id,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                )
+
+            if trace is not None:
+                trace.record_error(e, code=e.code.value if e.code is not None else None)
             self._emit(
                 kind=EventKind.LLM_REQUEST_FAILED,
                 payload={
