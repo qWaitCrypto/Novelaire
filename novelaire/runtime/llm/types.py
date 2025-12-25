@@ -38,6 +38,19 @@ class ModelLimits:
 
 
 @dataclass(frozen=True)
+class ContextManagementConfig:
+    # When set to a value between 0 and 1, auto-compact triggers if estimated_input/context_limit > threshold.
+    # Disabled if <= 0 or >= 1, or if unset.
+    auto_compact_threshold_ratio: float | None = None
+    # Budget for retained history after compaction: floor(context_limit * ratio).
+    history_budget_ratio: float | None = None
+    # Fallback budget when context limit is unknown.
+    history_budget_fallback_tokens: int | None = None
+    # Per-tool-message budget when preparing compaction input.
+    tool_output_budget_tokens: int | None = None
+
+
+@dataclass(frozen=True)
 class ModelCapabilities:
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
@@ -75,6 +88,7 @@ class ModelProfile:
     capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
     tags: set[str] = field(default_factory=set)
     limits: ModelLimits | None = None
+    context_management: ContextManagementConfig | None = None
 
 
 @dataclass(frozen=True)

@@ -339,6 +339,15 @@ class LLMClient:
             client = OpenAI(api_key=api_key, base_url=profile.base_url, max_retries=0)
             payload = OpenAICompatibleAdapter().prepare_request(profile, request).json
             request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
+            added_stream_usage = False
+            stream_options = payload.get("stream_options")
+            if stream_options is None:
+                payload["stream_options"] = {"include_usage": True}
+                added_stream_usage = True
+            elif isinstance(stream_options, dict):
+                if stream_options.get("include_usage") is None:
+                    stream_options["include_usage"] = True
+                    added_stream_usage = True
             if trace is not None:
                 trace.record_prepared_request(
                     provider_kind=profile.provider_kind,
@@ -637,13 +646,41 @@ class LLMClient:
                 else:
                     raw_stream = client.chat.completions.create(**payload, stream=True)
             except openai.OpenAIError as e:
-                raise wrap_provider_exception(
-                    e,
-                    provider_kind=profile.provider_kind,
-                    profile_id=profile.profile_id,
-                    model=profile.model_name,
-                    operation="stream",
-                ) from e
+                status_code = getattr(e, "status_code", None)
+                if (
+                    added_stream_usage
+                    and status_code == 400
+                    and ("stream_options" in str(e) or "include_usage" in str(e))
+                ):
+                    try:
+                        payload.pop("stream_options", None)
+                    except Exception:
+                        pass
+                    if trace is not None:
+                        trace.record_meta(stream_include_usage_rejected=True)
+                    try:
+                        if timeout_arg is not None:
+                            raw_stream = client.chat.completions.create(
+                                **payload, stream=True, timeout=timeout_arg
+                            )
+                        else:
+                            raw_stream = client.chat.completions.create(**payload, stream=True)
+                    except openai.OpenAIError as e2:
+                        raise wrap_provider_exception(
+                            e2,
+                            provider_kind=profile.provider_kind,
+                            profile_id=profile.profile_id,
+                            model=profile.model_name,
+                            operation="stream",
+                        ) from e2
+                else:
+                    raise wrap_provider_exception(
+                        e,
+                        provider_kind=profile.provider_kind,
+                        profile_id=profile.profile_id,
+                        model=profile.model_name,
+                        operation="stream",
+                    ) from e
             except ProviderAdapterError as e:
                 raise LLMRequestError(
                     str(e),
