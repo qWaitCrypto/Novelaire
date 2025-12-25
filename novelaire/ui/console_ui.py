@@ -126,7 +126,17 @@ class ConsoleUI:
                     self.emit(ev)
 
     def _tool_category(self, tool_name: str) -> str:
-        if tool_name in {"project__read_text", "project__search_text"} or tool_name.startswith("skill__"):
+        if tool_name in {
+            "project__read_text",
+            "project__read_text_many",
+            "project__search_text",
+            "project__list_dir",
+            "project__glob",
+            "project__text_stats",
+            "session__search",
+            "web__fetch",
+            "web__search",
+        } or tool_name.startswith("skill__"):
             return "Explored"
         if tool_name in {"project__write_text", "project__text_editor"}:
             return "Edited"
@@ -134,6 +144,8 @@ class ConsoleUI:
             return "Planned"
         if tool_name.startswith("spec__"):
             return "Spec"
+        if tool_name == "session__export":
+            return "Ran"
         if tool_name == "shell__run":
             return "Ran"
         return "Tools"

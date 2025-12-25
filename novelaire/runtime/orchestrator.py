@@ -52,8 +52,16 @@ from .tools import (
     ProjectSearchTextTool,
     ProjectTextEditorTool,
     ProjectWriteTextTool,
+    ProjectListDirTool,
+    ProjectGlobTool,
+    ProjectReadTextManyTool,
     PlannedToolCall,
     ShellRunTool,
+    SessionSearchTool,
+    SessionExportTool,
+    WebFetchTool,
+    WebSearchTool,
+    ProjectTextStatsTool,
     SkillListTool,
     SkillLoadTool,
     SkillReadFileTool,
@@ -140,7 +148,15 @@ class Orchestrator:
         registry.register(ProjectWriteTextTool())
         registry.register(ProjectTextEditorTool())
         registry.register(ProjectSearchTextTool())
+        registry.register(ProjectListDirTool())
+        registry.register(ProjectGlobTool())
+        registry.register(ProjectReadTextManyTool())
+        registry.register(ProjectTextStatsTool())
         registry.register(ShellRunTool())
+        registry.register(WebFetchTool())
+        registry.register(WebSearchTool())
+        registry.register(SessionSearchTool())
+        registry.register(SessionExportTool())
         registry.register(SkillListTool(skill_store))
         registry.register(SkillLoadTool(skill_store))
         registry.register(SkillReadFileTool(skill_store))
@@ -1979,6 +1995,36 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
             return f"Search {_q(query)}"
         return "Search text"
 
+    if tool_name == "project__list_dir":
+        path = arguments.get("path") or "."
+        recursive = arguments.get("recursive")
+        if isinstance(path, str) and path:
+            suffix = " (recursive)" if recursive is True else ""
+            return f"List {_q(path)}{suffix}"
+        return "List directory"
+
+    if tool_name == "project__glob":
+        pats = arguments.get("patterns")
+        base = arguments.get("base")
+        if isinstance(pats, list) and pats:
+            n = len(pats)
+            if isinstance(base, str) and base:
+                return f"Glob {n} pattern(s) in {_q(base)}"
+            return f"Glob {n} pattern(s)"
+        return "Glob files"
+
+    if tool_name == "project__read_text_many":
+        paths = arguments.get("paths")
+        if isinstance(paths, list) and paths:
+            return f"Read {len(paths)} file(s)"
+        return "Read many files"
+
+    if tool_name == "project__text_stats":
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            return f"Text stats {_q(path)}"
+        return "Text stats"
+
     if tool_name == "project__write_text":
         path = arguments.get("path")
         if isinstance(path, str) and path:
@@ -2002,6 +2048,30 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
                 one_line = one_line[:79] + "…"
             return f"Run $ {one_line}"
         return "Run shell command"
+
+    if tool_name == "web__fetch":
+        url = arguments.get("url")
+        if isinstance(url, str) and url:
+            return f"Fetch {_q(url)}"
+        return "Fetch URL"
+
+    if tool_name == "web__search":
+        query = arguments.get("query")
+        if isinstance(query, str) and query:
+            return f"Search web {_q(query)}"
+        return "Search web"
+
+    if tool_name == "session__search":
+        query = arguments.get("query")
+        if isinstance(query, str) and query:
+            return f"Search sessions {_q(query)}"
+        return "Search sessions"
+
+    if tool_name == "session__export":
+        sid = arguments.get("session_id")
+        if isinstance(sid, str) and sid:
+            return f"Export session ({_q(sid)})"
+        return "Export session"
 
     if tool_name == "update_plan":
         return "Update plan"

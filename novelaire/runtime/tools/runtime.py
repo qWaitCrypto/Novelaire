@@ -174,6 +174,30 @@ class ToolRuntime:
         if self._approval_mode is ToolApprovalMode.STRICT:
             return self._inspect_strict(planned)
 
+        tool_name = planned.tool_name
+
+        if tool_name in {"web__fetch", "web__search"}:
+            diff_ref = self._build_args_preview(planned, summary=f"Preview for {tool_name}")
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=f"Execute tool: {tool_name}",
+                risk_level="high",
+                reason="Web access can exfiltrate data and may be unsafe; approval required in standard mode.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
+        if tool_name == "session__export":
+            diff_ref = self._build_args_preview(planned, summary="Preview for session__export (bundle output)")
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=f"Export session: {planned.arguments.get('session_id')}",
+                risk_level="high",
+                reason="Export writes files into the project; approval required in standard mode.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
         if planned.tool_name == "shell__run":
             summary = _summarize_shell_run_args(planned.arguments)
             try:
