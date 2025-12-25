@@ -34,6 +34,7 @@ class EventKind(str, Enum):
 
 class OpKind(str, Enum):
     CHAT = "chat"
+    COMPACT = "compact"
     APPROVAL_DECISION = "approval_decision"
 
 

@@ -77,6 +77,7 @@ class ConsoleUI:
         self._plain_waiting_printed = False
         self._saw_thinking = False
         self._printed_think_preview = False
+        self._spinner_label = "Thinking"
 
         # Tool log buffering (Codex/Goose-style): group tool calls into a compact block
         # and flush before the next LLM request starts.
@@ -289,6 +290,7 @@ class ConsoleUI:
             self._plain_waiting_printed = False
             self._saw_thinking = False
             self._printed_think_preview = False
+            self._spinner_label = str(p.get("label") or "Thinking")
             self._paint_spinner()
             return
 
@@ -565,14 +567,14 @@ class ConsoleUI:
             return
         if not self._ansi:
             if not self._plain_waiting_printed:
-                self._println_dim("Thinking…")
+                self._println_dim(f"{self._spinner_label}…")
                 self._plain_waiting_printed = True
             return
         # "circle" frames; fallback to ASCII if the terminal can't render them is fine.
         frames: Sequence[str] = ("◌", "◍", "●", "◍")
         ch = frames[self._spinner_frame % len(frames)]
         self._spinner_frame += 1
-        msg = "Thinking"
+        msg = self._spinner_label
         snippet_raw = self._thinking_buf.strip().replace("\n", " ")
 
         cols = shutil.get_terminal_size((80, 20)).columns
