@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from dataclasses import replace
@@ -546,10 +547,27 @@ def _run_chat_console_ui(
         except Exception:
             return False
 
-    # Input: prompt_toolkit if available in a TTY; otherwise basic input().
+    def _should_use_prompt_toolkit() -> bool:
+        # Let callers (and tests) force plain input mode.
+        if str(os.environ.get("NOVELAIRE_PLAIN_INPUT") or "").strip() in {"1", "true", "yes", "on"}:
+            return False
+        if not _is_tty():
+            return False
+        # If builtins.input is patched (e.g. unittest.mock), prefer plain input so tests can drive the CLI.
+        try:
+            import builtins as _builtins
+
+            mod = getattr(type(getattr(_builtins, "input")), "__module__", "")
+            if isinstance(mod, str) and mod.startswith("unittest.mock"):
+                return False
+        except Exception:
+            pass
+        return True
+
+    # Input: prompt_toolkit if available and appropriate; otherwise basic input().
     prompt_session = None
     status_bar = {"context": "100% context left"}
-    if _is_tty():
+    if _should_use_prompt_toolkit():
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.completion import Completer, Completion

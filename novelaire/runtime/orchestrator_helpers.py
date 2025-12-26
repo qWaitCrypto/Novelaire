@@ -69,6 +69,15 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
             return f"Text stats {_q(path)}"
         return "Text stats"
 
+    if tool_name == "project__aigc_detect":
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            return f"AIGC detect {_q(path)}"
+        text = arguments.get("text")
+        if isinstance(text, str) and text.strip():
+            return "AIGC detect text"
+        return "AIGC detect"
+
     if tool_name == "project__write_text":
         path = arguments.get("path")
         if isinstance(path, str) and path:
@@ -242,4 +251,3 @@ def _canonical_request_from_artifact_json(raw: str) -> CanonicalRequest:
     if not isinstance(params, dict):
         params = {}
     return CanonicalRequest(system=str(system) if system is not None else None, messages=messages, params=params)
-

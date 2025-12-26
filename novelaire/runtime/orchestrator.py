@@ -48,6 +48,7 @@ from .tools import (
     WebFetchTool,
     WebSearchTool,
     ProjectTextStatsTool,
+    ProjectAIGCDetectTool,
     SkillListTool,
     SkillLoadTool,
     SkillReadFileTool,
@@ -156,6 +157,7 @@ class Orchestrator:
         registry.register(ProjectGlobTool())
         registry.register(ProjectReadTextManyTool())
         registry.register(ProjectTextStatsTool())
+        registry.register(ProjectAIGCDetectTool())
         registry.register(ShellRunTool())
         registry.register(WebFetchTool())
         registry.register(WebSearchTool())
