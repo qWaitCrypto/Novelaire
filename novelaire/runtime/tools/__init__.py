@@ -23,6 +23,7 @@ from .plan import UpdatePlanTool
 from .spec_workflow import SpecApplyTool, SpecGetTool, SpecProposeTool, SpecQueryTool, SpecSealTool
 from .session_tools import SessionExportTool, SessionSearchTool
 from .text_stats import ProjectTextStatsTool
+from .aigc_detect import ProjectAIGCDetectTool
 from .web import WebFetchTool, WebSearchTool
 
 __all__ = [
@@ -56,4 +57,5 @@ __all__ = [
     "WebFetchTool",
     "WebSearchTool",
     "ProjectTextStatsTool",
+    "ProjectAIGCDetectTool",
 ]
