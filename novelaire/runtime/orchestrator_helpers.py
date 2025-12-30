@@ -126,6 +126,25 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
             return f"Export session ({_q(sid)})"
         return "Export session"
 
+    if tool_name == "mcp__list_servers":
+        return "List MCP servers"
+
+    if tool_name == "mcp__list_tools":
+        server = arguments.get("server")
+        if isinstance(server, str) and server:
+            tool_name_filter = arguments.get("tool_name")
+            if isinstance(tool_name_filter, str) and tool_name_filter:
+                return f"List MCP tools ({_q(server)}:{_q(tool_name_filter)})"
+            return f"List MCP tools ({_q(server)})"
+        return "List MCP tools"
+
+    if tool_name == "mcp__call_tool":
+        server = arguments.get("server")
+        tool = arguments.get("tool")
+        if isinstance(server, str) and isinstance(tool, str) and server and tool:
+            return f"Call MCP ({_q(server)}:{_q(tool)})"
+        return "Call MCP tool"
+
     if tool_name == "update_plan":
         return "Update plan"
 

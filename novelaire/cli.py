@@ -1874,6 +1874,57 @@ def _cmd_init(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
 
+    mcp_path = project_root / ".novelaire" / "config" / "mcp.json"
+    if not mcp_path.exists():
+        mcp_path.write_text(
+            "\n".join(
+                [
+                    "{",
+                    '  "_comment": "MCP server configuration (router mode). Add servers under mcpServers and set enabled=true. Note: in standard mode, MCP tool calls are not approval-gated, so keep network-capable servers disabled unless you intend to allow them.",',
+                    '  "mcpServers": {',
+                    '    "filesystem": {',
+                    '      "_comment": "General-purpose filesystem MCP. Prefer Novelaire built-in project tools when possible. IMPORTANT: restrict allowed directories.",',
+                    '      "enabled": false,',
+                    '      "command": "npx",',
+                    '      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/directory"],',
+                    '      "env": {},',
+                    '      "cwd": "",',
+                    '      "timeout_s": 60',
+                    "    },",
+                    '    "memory": {',
+                    '      "_comment": "General-purpose memory MCP (useful for long-lived notes/recall across sessions).",',
+                    '      "enabled": false,',
+                    '      "command": "npx",',
+                    '      "args": ["-y", "@modelcontextprotocol/server-memory"],',
+                    '      "env": {},',
+                    '      "cwd": "",',
+                    '      "timeout_s": 60',
+                    "    },",
+                    '    "fetch": {',
+                    '      "_comment": "Network-capable fetch MCP. Keep disabled unless you explicitly want network access via MCP.",',
+                    '      "enabled": false,',
+                    '      "command": "uvx",',
+                    '      "args": ["mcp-server-fetch"],',
+                    '      "env": {},',
+                    '      "cwd": "",',
+                    '      "timeout_s": 60',
+                    "    },",
+                    '    "example": {',
+                    '      "enabled": false,',
+                    '      "command": "",',
+                    '      "args": [],',
+                    '      "env": {},',
+                    '      "cwd": "",',
+                    '      "timeout_s": 60',
+                    "    }",
+                    "  }",
+                    "}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
     skipped = seed_builtin_skills(project_root=project_root)
     if skipped:
         print("Skipped seeding existing skills:")
