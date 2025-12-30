@@ -25,6 +25,7 @@ from .session_tools import SessionExportTool, SessionSearchTool
 from .text_stats import ProjectTextStatsTool
 from .aigc_detect import ProjectAIGCDetectTool
 from .web import WebFetchTool, WebSearchTool
+from .mcp_router import McpCallToolTool, McpListServersTool, McpListToolsTool
 
 __all__ = [
     "ToolRegistry",
@@ -58,4 +59,7 @@ __all__ = [
     "WebSearchTool",
     "ProjectTextStatsTool",
     "ProjectAIGCDetectTool",
+    "McpListServersTool",
+    "McpListToolsTool",
+    "McpCallToolTool",
 ]

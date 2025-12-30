@@ -136,6 +136,8 @@ class ConsoleUI:
             "session__search",
             "web__fetch",
             "web__search",
+            "mcp__list_servers",
+            "mcp__list_tools",
         } or tool_name.startswith("skill__"):
             return "Explored"
         if tool_name in {"project__write_text", "project__text_editor"}:
