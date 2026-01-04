@@ -78,20 +78,14 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
             return "AIGC detect text"
         return "AIGC detect"
 
-    if tool_name == "project__write_text":
-        path = arguments.get("path")
-        if isinstance(path, str) and path:
-            return f"Write {_q(path)}"
-        return "Write file"
+    if tool_name == "project__apply_patch":
+        return "Apply patch"
 
-    if tool_name == "project__text_editor":
-        command = arguments.get("command")
-        path = arguments.get("path")
-        if isinstance(command, str) and isinstance(path, str) and path:
-            return f"Edit {_q(path)} ({command})"
-        if isinstance(path, str) and path:
-            return f"Edit {_q(path)}"
-        return "Edit file"
+    if tool_name == "project__apply_edits":
+        ops = arguments.get("ops")
+        if isinstance(ops, list) and ops:
+            return f"Apply edits ({len(ops)} op(s))"
+        return "Apply edits"
 
     if tool_name == "shell__run":
         command = arguments.get("command")

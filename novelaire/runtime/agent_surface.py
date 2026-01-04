@@ -34,6 +34,22 @@ def build_agent_surface(
     if len(tools) > max_tool_lines:
         tool_lines.append(f"- ... ({len(tools) - max_tool_lines} more)")
 
+    tool_notes: list[str] = []
+    if "project__apply_edits" in tool_names:
+        tool_notes.extend(
+            [
+                "- Prefer `project__apply_edits` for normal file edits; it uses structured JSON ops (no patch DSL).",
+                "- For `update_file`/`insert_*`/`replace_substring_*`, copy exact lines/substrings via `project__read_text`/`project__search_text` (no guessing).",
+            ]
+        )
+    if "project__apply_patch" in tool_names:
+        tool_notes.extend(
+            [
+                "- `project__apply_patch` expects Codex apply_patch format, NOT unified diff (`---/+++`).",
+                "- Patch must start with `*** Begin Patch` and end with `*** End Patch` (no ``` fences).",
+            ]
+        )
+
     skill_lines = []
     for meta in skills[: max_skill_lines]:
         skill_lines.append(f"- {meta.name}: {meta.description}")
@@ -76,6 +92,7 @@ def build_agent_surface(
             "",
             "## Tools",
             *tools_section,
+            *([] if not tool_notes else ["", "Notes:", *tool_notes]),
             "",
             "## Skills",
             "Rules:",
