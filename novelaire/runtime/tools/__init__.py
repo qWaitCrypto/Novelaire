@@ -3,8 +3,6 @@ from __future__ import annotations
 from .builtins import (
     ProjectReadTextTool,
     ProjectSearchTextTool,
-    ProjectTextEditorTool,
-    ProjectWriteTextTool,
     ShellRunTool,
 )
 from .discovery import ProjectGlobTool, ProjectListDirTool, ProjectReadTextManyTool
@@ -26,6 +24,8 @@ from .text_stats import ProjectTextStatsTool
 from .aigc_detect import ProjectAIGCDetectTool
 from .web import WebFetchTool, WebSearchTool
 from .mcp_router import McpCallToolTool, McpListServersTool, McpListToolsTool
+from .apply_patch_tool import ProjectApplyPatchTool
+from .apply_edits_tool import ProjectApplyEditsTool
 
 __all__ = [
     "ToolRegistry",
@@ -38,8 +38,6 @@ __all__ = [
     "ToolExecutionResult",
     "ProjectReadTextTool",
     "ProjectSearchTextTool",
-    "ProjectTextEditorTool",
-    "ProjectWriteTextTool",
     "ShellRunTool",
     "ProjectListDirTool",
     "ProjectGlobTool",
@@ -59,6 +57,8 @@ __all__ = [
     "WebSearchTool",
     "ProjectTextStatsTool",
     "ProjectAIGCDetectTool",
+    "ProjectApplyPatchTool",
+    "ProjectApplyEditsTool",
     "McpListServersTool",
     "McpListToolsTool",
     "McpCallToolTool",

@@ -1613,6 +1613,7 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
                     "duration_ms": payload.get("duration_ms"),
                     "error_code": payload.get("error_code"),
                     "error": payload.get("error"),
+                    "details": payload.get("details") if isinstance(payload.get("details"), list) else None,
                     "ok": not bool(payload.get("error")),
                 },
             )

@@ -140,7 +140,7 @@ class ConsoleUI:
             "mcp__list_tools",
         } or tool_name.startswith("skill__"):
             return "Explored"
-        if tool_name in {"project__write_text", "project__text_editor"}:
+        if tool_name in {"project__apply_patch", "project__apply_edits"}:
             return "Edited"
         if tool_name == "update_plan":
             return "Planned"
@@ -372,6 +372,7 @@ class ConsoleUI:
             duration_ms = p.get("duration_ms")
             error_code = p.get("error_code")
             error = p.get("error")
+            details = p.get("details")
 
             suffix_parts: list[str] = []
             if isinstance(duration_ms, int) and duration_ms >= 500:
@@ -396,7 +397,16 @@ class ConsoleUI:
                 suffix = " (" + "; ".join(suffix_parts) + ")"
 
             category = self._tool_category(tool)
-            self._queue_tool_item(category=category, line=summary + suffix)
+            suppress_summary = tool == "project__apply_patch" and isinstance(details, list) and details
+            if not suppress_summary:
+                self._queue_tool_item(category=category, line=summary + suffix)
+            if isinstance(details, list):
+                for item in details:
+                    if not isinstance(item, str):
+                        continue
+                    s = item.rstrip("\r\n")
+                    if s.strip():
+                        self._queue_tool_item(category=category, line=s)
             return
 
         if k is UIEventKind.PLAN_UPDATED:
