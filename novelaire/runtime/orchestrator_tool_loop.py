@@ -7,7 +7,7 @@ from .error_codes import ErrorCode
 from .ids import new_id, now_ts_ms
 from .llm.types import CanonicalMessage, CanonicalMessageRole
 from .protocol import EventKind, OpKind
-from .tools import InspectionDecision, PlannedToolCall, ToolRuntimeError
+from .tools import InspectionDecision, PlannedToolCall, ToolExecutionContext, ToolRuntimeError
 from .orchestrator_helpers import _planned_tool_call_descriptor, _summarize_tool_for_ui
 
 
@@ -251,7 +251,14 @@ def handle_planned_tool_calls(
             step_id=planned.tool_execution_id,
         )
         try:
-            result = orch.tool_runtime.execute(planned)
+            ctx = ToolExecutionContext(
+                session_id=orch.session_id,
+                request_id=request_id,
+                turn_id=turn_id,
+                tool_execution_id=planned.tool_execution_id,
+                event_bus=orch.event_bus,
+            )
+            result = orch.tool_runtime.execute(planned, context=ctx)
         except KeyboardInterrupt:
             orch._emit(
                 kind=EventKind.TOOL_CALL_END,

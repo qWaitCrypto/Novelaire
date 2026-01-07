@@ -13,6 +13,7 @@ from .runtime import (
     PlannedToolCall,
     ToolApprovalMode,
     ToolExecutionResult,
+    ToolExecutionContext,
     ToolRuntime,
     ToolRuntimeError,
 )
@@ -33,6 +34,7 @@ from .web import WebFetchTool, WebSearchTool
 from .mcp_router import McpCallToolTool, McpListServersTool, McpListToolsTool
 from .apply_patch_tool import ProjectApplyPatchTool
 from .apply_edits_tool import ProjectApplyEditsTool
+from .subagent_runner import SubagentRunTool
 
 __all__ = [
     "ToolRegistry",
@@ -43,6 +45,7 @@ __all__ = [
     "PlannedToolCall",
     "ToolApprovalMode",
     "ToolExecutionResult",
+    "ToolExecutionContext",
     "ProjectReadTextTool",
     "ProjectSearchTextTool",
     "ShellRunTool",
@@ -71,6 +74,7 @@ __all__ = [
     "ProjectAIGCDetectTool",
     "ProjectApplyPatchTool",
     "ProjectApplyEditsTool",
+    "SubagentRunTool",
     "McpListServersTool",
     "McpListToolsTool",
     "McpCallToolTool",
