@@ -19,6 +19,13 @@ from .runtime import (
 from .skills import SkillListTool, SkillLoadTool, SkillReadFileTool
 from .plan import UpdatePlanTool
 from .spec_workflow import SpecApplyTool, SpecGetTool, SpecProposeTool, SpecQueryTool, SpecSealTool
+from .snapshot_tools import (
+    SnapshotCreateTool,
+    SnapshotDiffTool,
+    SnapshotListTool,
+    SnapshotReadTextTool,
+    SnapshotRollbackTool,
+)
 from .session_tools import SessionExportTool, SessionSearchTool
 from .text_stats import ProjectTextStatsTool
 from .aigc_detect import ProjectAIGCDetectTool
@@ -51,6 +58,11 @@ __all__ = [
     "SpecProposeTool",
     "SpecApplyTool",
     "SpecSealTool",
+    "SnapshotListTool",
+    "SnapshotCreateTool",
+    "SnapshotReadTextTool",
+    "SnapshotDiffTool",
+    "SnapshotRollbackTool",
     "SessionSearchTool",
     "SessionExportTool",
     "WebFetchTool",

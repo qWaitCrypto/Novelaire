@@ -1,1 +1,2 @@
 recursive-include novelaire/builtin/skills *
+recursive-include novelaire/runtime/prompts *.md
