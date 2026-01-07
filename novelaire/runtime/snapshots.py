@@ -32,6 +32,71 @@ class GitSnapshotBackend:
     def git_dir(self) -> Path:
         return self._git_dir
 
+    def is_initialized(self) -> bool:
+        return (self._git_dir / "HEAD").exists()
+
+    def list_labels(self, *, max_results: int = 50) -> list[dict[str, str | None]]:
+        if max_results < 1:
+            raise ValueError("max_results must be >= 1.")
+        if not self.is_initialized():
+            return []
+        text = self._git_stdout(
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)\t%(objectname)\t%(committerdate:iso8601)\t%(subject)",
+            "refs/tags",
+        )
+        out: list[dict[str, str | None]] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            label = parts[0].strip() if len(parts) > 0 else ""
+            commit = parts[1].strip() if len(parts) > 1 else ""
+            committed_at = parts[2].strip() if len(parts) > 2 else ""
+            subject = parts[3].strip() if len(parts) > 3 else ""
+            if not label:
+                continue
+            out.append(
+                {
+                    "label": label,
+                    "commit": commit or None,
+                    "committed_at": committed_at or None,
+                    "subject": subject or None,
+                }
+            )
+            if len(out) >= max_results:
+                break
+        return out
+
+    def read_text(self, *, ref: str, path: str) -> str:
+        ref = ref.strip()
+        if not ref:
+            raise ValueError("Missing ref.")
+        path = path.strip().replace("\\", "/").lstrip("/")
+        if not path:
+            raise ValueError("Missing path.")
+        if any(part in {"..", ""} for part in Path(path).parts):
+            raise ValueError("Invalid path.")
+        if not self.is_initialized():
+            raise SnapshotError("No snapshots yet.")
+        return self._git_stdout("show", f"{ref}:{path}")
+
+    def diff(self, *, a: str, b: str, path: str | None = None) -> str:
+        a = a.strip()
+        b = b.strip()
+        if not a or not b:
+            raise ValueError("Missing ref(s) for diff.")
+        if not self.is_initialized():
+            raise SnapshotError("No snapshots yet.")
+        args: list[str] = ["diff", a, b]
+        if isinstance(path, str) and path.strip():
+            normalized = path.strip().replace("\\", "/").lstrip("/")
+            if any(part in {"..", ""} for part in Path(normalized).parts):
+                raise ValueError("Invalid path.")
+            args += ["--", normalized]
+        return self._git_stdout(*args)
+
     def snapshot_create(self, *, reason: str) -> SnapshotResult:
         self._ensure_repo()
         self._ensure_excludes()
@@ -74,6 +139,7 @@ class GitSnapshotBackend:
         info.mkdir(parents=True, exist_ok=True)
         exclude = info / "exclude"
         patterns = [
+            ".git",
             ".novelaire/state/git/",
             ".novelaire/cache/",
             ".novelaire/index/",
@@ -111,7 +177,7 @@ class GitSnapshotBackend:
             proc = subprocess.run(
                 cmd,
                 check=False,
-                capture_output=capture,
+                capture_output=True,
                 text=True,
                 env=env,
             )
@@ -120,5 +186,6 @@ class GitSnapshotBackend:
         if proc.returncode != 0:
             stderr = proc.stderr.strip() if proc.stderr else ""
             raise SnapshotError(f"git failed ({proc.returncode}): {' '.join(args)}\n{stderr}".rstrip())
-        return proc.stdout or ""
-
+        if capture:
+            return proc.stdout or ""
+        return ""

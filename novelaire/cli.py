@@ -1781,8 +1781,26 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     project_root.mkdir(parents=True, exist_ok=True)
 
+    spec_subdirs = [
+        "premise",
+        "world",
+        "system",
+        "characters",
+        "factions",
+        "locations",
+        "timeline",
+        "narrative",
+        "style",
+        "objects",
+        "glossary",
+        "continuity",
+        "serialization",
+        "quality",
+        "modules",
+    ]
+
     author_dirs = [
-        project_root / "spec",
+        *(project_root / "spec" / subdir for subdir in spec_subdirs),
         project_root / "outline",
         project_root / "chapters",
         project_root / "drafts",

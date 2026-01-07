@@ -142,6 +142,27 @@ class ToolRuntime:
             )
 
         # Domain invariants / mandatory approvals (override all modes).
+        if planned.tool_name == "snapshot__rollback":
+            target = planned.arguments.get("target")
+            create_backup = planned.arguments.get("create_backup")
+            backup_label = planned.arguments.get("backup_label")
+            preview = (
+                "Rollback project files to an internal snapshot ref.\n\n"
+                f"Target: {target}\n"
+                f"Create backup: {create_backup}\n"
+                f"Backup label: {backup_label}\n\n"
+                "WARNING: This operation overwrites files in the project working tree.\n"
+                "Approval is required.\n"
+            )
+            diff_ref = self._artifact_store.put(preview, kind="diff", meta={"summary": "Snapshot rollback preview"})
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=f"Rollback snapshot: {target}",
+                risk_level="high",
+                reason="Rolling back overwrites project files and may discard uncommitted changes.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
         sealed = self._is_spec_sealed()
         sealed_violation = self._check_sealed_spec_violation(planned, sealed=sealed)
         if sealed_violation is not None:

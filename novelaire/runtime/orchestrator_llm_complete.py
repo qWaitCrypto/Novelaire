@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .error_codes import ErrorCode
@@ -49,59 +50,114 @@ def run_llm_complete(
         step_id=step_id,
     )
 
-    try:
-        final_response = orch.llm_client.complete(
-            role=ModelRole.MAIN,
-            requirements=ModelRequirements(needs_streaming=False, needs_tools=bool(request.tools)),
-            request=request,
-            timeout_s=timeout_s,
-            cancel=cancel,
-            trace=trace,
-        )
-    except LLMRequestError as e:
-        if trace is not None:
-            if e.code is ErrorCode.CANCELLED:
-                trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
-            else:
-                trace.record_error(e, code=e.code.value if e.code is not None else None)
-        orch._emit(
-            kind=EventKind.LLM_REQUEST_FAILED,
-            payload={
-                "error": str(e),
-                "error_code": e.code.value,
-                "code": e.code.value if e.code is not None else None,
-                "provider_kind": e.provider_kind.value if e.provider_kind is not None else None,
-                "profile_id": e.profile_id,
-                "model": e.model,
-                "retryable": e.retryable,
-                "details": e.details,
-            },
-            request_id=request_id,
-            turn_id=turn_id,
-            step_id=step_id,
-        )
-        if e.code is ErrorCode.CANCELLED:
+    attempt = 1
+    max_attempts = 2
+    while True:
+        try:
+            final_response = orch.llm_client.complete(
+                role=ModelRole.MAIN,
+                requirements=ModelRequirements(needs_streaming=False, needs_tools=bool(request.tools)),
+                request=request,
+                timeout_s=timeout_s,
+                cancel=cancel,
+                trace=trace,
+            )
+            break
+        except LLMRequestError as e:
+            if trace is not None:
+                if e.code is ErrorCode.CANCELLED:
+                    trace.record_cancelled(reason="cancelled", code=ErrorCode.CANCELLED.value)
+                else:
+                    trace.record_error(e, code=e.code.value if e.code is not None else None)
+                try:
+                    trace.write_json(
+                        f"complete_error_attempt_{attempt}.json",
+                        {
+                            "attempt": attempt,
+                            "error": str(e),
+                            "error_code": e.code.value if e.code is not None else None,
+                            "provider_kind": e.provider_kind.value if e.provider_kind is not None else None,
+                            "profile_id": e.profile_id,
+                            "model": e.model,
+                            "retryable": e.retryable,
+                            "details": e.details,
+                        },
+                    )
+                except Exception:
+                    pass
             orch._emit(
-                kind=EventKind.OPERATION_CANCELLED,
+                kind=EventKind.LLM_REQUEST_FAILED,
                 payload={
-                    "op_kind": OpKind.CHAT.value,
-                    "error_code": ErrorCode.CANCELLED.value,
-                    "reason": "cancelled",
-                    "phase": "llm_complete",
+                    "error": str(e),
+                    "error_code": e.code.value,
+                    "code": e.code.value if e.code is not None else None,
+                    "provider_kind": e.provider_kind.value if e.provider_kind is not None else None,
+                    "profile_id": e.profile_id,
+                    "model": e.model,
+                    "retryable": e.retryable,
+                    "details": e.details,
+                    "attempt": attempt,
                 },
                 request_id=request_id,
                 turn_id=turn_id,
                 step_id=step_id,
             )
+            if e.code is ErrorCode.CANCELLED:
+                orch._emit(
+                    kind=EventKind.OPERATION_CANCELLED,
+                    payload={
+                        "op_kind": OpKind.CHAT.value,
+                        "error_code": ErrorCode.CANCELLED.value,
+                        "reason": "cancelled",
+                        "phase": "llm_complete",
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                return None, []
+
+            can_retry = bool(e.retryable) and attempt < max_attempts and not cancel.cancelled
+            if can_retry:
+                attempt += 1
+                orch._emit(
+                    kind=EventKind.OPERATION_PROGRESS,
+                    payload={
+                        "op_kind": OpKind.CHAT.value,
+                        "message": f"LLM request failed ({e.code.value}); retrying (attempt {attempt}/{max_attempts}).",
+                        "error_code": e.code.value,
+                        "phase": "llm_complete",
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                orch._emit(
+                    kind=EventKind.LLM_REQUEST_STARTED,
+                    payload={
+                        "role": ModelRole.MAIN.value,
+                        "context_ref": context_ref,
+                        "profile_id": profile_id,
+                        "timeout_s": timeout_s,
+                        "stream": False,
+                        "context_stats": dict(context_stats or {}),
+                        "attempt": attempt,
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                time.sleep(0.25 * float(attempt))
+                continue
+
+            orch._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={"error": str(e), "error_code": e.code.value, "type": "llm_request"},
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
             return None, []
-        orch._emit(
-            kind=EventKind.OPERATION_FAILED,
-            payload={"error": str(e), "error_code": e.code.value, "type": "llm_request"},
-            request_id=request_id,
-            turn_id=turn_id,
-            step_id=step_id,
-        )
-        return None, []
 
     assistant_text = final_response.text
     if assistant_text:
@@ -135,4 +191,3 @@ def run_llm_complete(
         extra_payload={"stream": False},
     )
     return final_response, planned_calls
-

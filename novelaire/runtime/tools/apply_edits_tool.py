@@ -162,6 +162,27 @@ def _optional_str_list_field(obj: dict[str, Any], key: str) -> list[str] | None:
     return out
 
 
+def _flatten_embedded_newlines(lines: list[str]) -> list[str]:
+    """
+    Some callers provide a list with a single item containing embedded newlines.
+
+    The edit engine expects a list of *individual lines*, so we normalize this
+    by splitting on '\\n'. This preserves strict matching semantics at the line
+    level while avoiding surprising failures for well-intentioned callers.
+    """
+
+    out: list[str] = []
+    for item in lines:
+        if "\n" not in item:
+            out.append(item)
+            continue
+        parts = item.split("\n")
+        if parts and parts[-1] == "":
+            parts.pop()
+        out.extend(parts)
+    return out
+
+
 def _apply_insert_relative(
     *,
     content: str,
@@ -227,7 +248,7 @@ class ProjectApplyEditsTool:
                         "- move_file: {from, to}\n"
                         "- update_file: {path, chunks, move_to?} where chunks[] = {change_context?, old_lines, new_lines, is_end_of_file?}\n"
                         "- insert_before|insert_after: {path, anchor_lines, new_lines}\n"
-                        "- prepend_lines|append_lines: {path, new_lines}\n"
+                        "- prepend_lines|append_lines: {path, new_lines} (or {path, lines} for back-compat)\n"
                         "- replace_substring_first|replace_substring_all: {path, old, new, expected_count?}\n\n"
                         "IMPORTANT: Matching is exact. For ops that reference existing content "
                         "(`update_file`, `insert_*`, `replace_substring_*`), you MUST copy the "
@@ -419,6 +440,8 @@ class ProjectApplyEditsTool:
                         raise ValueError(f"Invalid change_context at chunk {idx} (expected string or null).")
                     old_lines = _optional_str_list_field(c, "old_lines") or []
                     new_lines = _optional_str_list_field(c, "new_lines") or []
+                    old_lines = _flatten_embedded_newlines(list(old_lines))
+                    new_lines = _flatten_embedded_newlines(list(new_lines))
                     is_end_of_file = c.get("is_end_of_file")
                     if is_end_of_file is None:
                         is_end_of_file = False
@@ -451,8 +474,8 @@ class ProjectApplyEditsTool:
 
             if op_kind in {"insert_before", "insert_after"}:
                 path = _require_str_field(raw_op, "path")
-                anchor_lines = _require_str_list_field(raw_op, "anchor_lines")
-                new_lines = _require_str_list_field(raw_op, "new_lines")
+                anchor_lines = _flatten_embedded_newlines(_require_str_list_field(raw_op, "anchor_lines"))
+                new_lines = _flatten_embedded_newlines(_require_str_list_field(raw_op, "new_lines"))
                 expected_sha256 = _optional_str_field(raw_op, "expected_sha256")
 
                 _resolve_in_project(project_root, path)
@@ -472,7 +495,11 @@ class ProjectApplyEditsTool:
 
             if op_kind in {"prepend_lines", "append_lines"}:
                 path = _require_str_field(raw_op, "path")
-                lines_to_add = _require_str_list_field(raw_op, "lines")
+                # Back-compat: accept both `new_lines` (documented) and `lines` (older tool callers).
+                if raw_op.get("new_lines") is not None:
+                    lines_to_add = _flatten_embedded_newlines(_require_str_list_field(raw_op, "new_lines"))
+                else:
+                    lines_to_add = _flatten_embedded_newlines(_require_str_list_field(raw_op, "lines"))
                 expected_sha256 = _optional_str_field(raw_op, "expected_sha256")
 
                 _resolve_in_project(project_root, path)
