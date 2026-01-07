@@ -7,6 +7,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from ..event_bus import EventBus
+
 from ..protocol import ArtifactRef
 from ..error_codes import ErrorCode
 
@@ -87,6 +89,22 @@ class ToolExecutionResult:
     duration_ms: int
     error_code: ErrorCode | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionContext:
+    """
+    Optional execution context passed to tools.
+
+    Most tools ignore this. It's used by complex tools (e.g. subagents) that
+    need to emit progress events and attach diagnostics to the current request.
+    """
+
+    session_id: str
+    request_id: str | None
+    turn_id: str | None
+    tool_execution_id: str
+    event_bus: EventBus | None = None
 
 
 class ToolRuntime:
@@ -362,7 +380,7 @@ class ToolRuntime:
             diff_ref=None,
         )
 
-    def execute(self, planned: PlannedToolCall) -> ToolExecutionResult:
+    def execute(self, planned: PlannedToolCall, *, context: ToolExecutionContext | None = None) -> ToolExecutionResult:
         tool = self._registry.get(planned.tool_name)
         started = time.monotonic()
         if tool is None:
@@ -381,7 +399,10 @@ class ToolRuntime:
             )
 
         try:
-            raw = tool.execute(args=planned.arguments, project_root=self._project_root)
+            try:
+                raw = tool.execute(args=planned.arguments, project_root=self._project_root, context=context)
+            except TypeError:
+                raw = tool.execute(args=planned.arguments, project_root=self._project_root)
         except Exception as e:
             duration_ms = int((time.monotonic() - started) * 1000)
             code = _classify_tool_exception(e)

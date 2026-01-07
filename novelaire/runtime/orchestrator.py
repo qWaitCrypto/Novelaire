@@ -56,6 +56,7 @@ from .tools import (
     SkillLoadTool,
     SkillReadFileTool,
     UpdatePlanTool,
+    SubagentRunTool,
     SpecQueryTool,
     SpecGetTool,
     SpecProposeTool,
@@ -161,6 +162,7 @@ class Orchestrator:
         if effective_max_tool_turns > 256:
             raise ValueError("max_tool_turns must be <= 256")
         router = ModelRouter(model_config)
+        llm_client = LLMClient(model_config)
         skill_store = SkillStore(project_root=project_root)
         plan_store = PlanStore(session_store=session_store, session_id=session_id)
         spec_store = SpecStore(project_root=project_root)
@@ -201,6 +203,15 @@ class Orchestrator:
         registry.register(SnapshotDiffTool(snapshot_backend))
         registry.register(SnapshotRollbackTool(snapshot_backend))
         tool_runtime = ToolRuntime(project_root=project_root, registry=registry, artifact_store=artifact_store)
+        registry.register(
+            SubagentRunTool(
+                llm_client=llm_client,
+                model_router=router,
+                tool_registry=registry,
+                tool_runtime=tool_runtime,
+                artifact_store=artifact_store,
+            )
+        )
         return Orchestrator(
             project_root=project_root,
             session_id=session_id,
@@ -210,7 +221,7 @@ class Orchestrator:
             artifact_store=artifact_store,
             approval_store=approval_store,
             model_config=model_config,
-            llm_client=LLMClient(model_config),
+            llm_client=llm_client,
             model_router=router,
             skill_store=skill_store,
             plan_store=plan_store,
@@ -243,6 +254,13 @@ class Orchestrator:
         self.model_config = cfg
         self.model_router = ModelRouter(cfg)
         self.llm_client = LLMClient(cfg)
+
+        # Keep the subagent runner in sync with the active model/router.
+        if self.tool_registry is not None:
+            t = self.tool_registry.get("subagent__run")
+            if isinstance(t, SubagentRunTool):
+                t.llm_client = self.llm_client
+                t.model_router = self.model_router
 
     def load_history_from_events(self) -> None:
         history: list[CanonicalMessage] = []
