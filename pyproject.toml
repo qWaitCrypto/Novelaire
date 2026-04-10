@@ -5,10 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "novelaire"
 version = "0.1.0.dev0"
-description = "Spec-driven vibe writing CLI."
+description = "Spec-driven vibe writing CLI — treat your story like code."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
+authors = [{ name = "qWaitCrypto" }]
+keywords = ["llm", "writing", "cli", "creative-writing", "spec-driven", "agent"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Text Editors",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/qWaitCrypto/Novelaire"
+"Bug Tracker" = "https://github.com/qWaitCrypto/Novelaire/issues"
+
 dependencies = [
   "anthropic>=0.75.0",
   "openai>=2.14.0",
@@ -16,6 +33,9 @@ dependencies = [
   "rich>=13.7.0",
   "strictyaml>=1.7.3",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 novelaire = "novelaire.cli:main"
@@ -25,3 +45,14 @@ include = ["novelaire*"]
 
 [tool.setuptools.package-data]
 novelaire = ["builtin/skills/**/*", "runtime/prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
